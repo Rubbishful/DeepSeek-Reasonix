@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { initialState, reducer, replayPendingPromptsForActiveTab } from "../lib/useController";
+import { continueDelivery } from "../lib/deliveryContinue";
 import type { WireEvent } from "../lib/types";
 
 let passed = 0;
@@ -152,6 +153,31 @@ eq(
   true,
   "collaboration mode changes always reconcile the remembered plan restore intent",
 );
+eq(
+  appSource.includes("runtimeTransitionTabsRef.current.has(tabId)"),
+  true,
+  "runtime profile transitions reject rapid duplicate switches for one tab",
+);
+eq(
+  appSource.includes("delete pending.tokenMode") && appSource.includes("tokenMode: previous"),
+  true,
+  "failed runtime profile transitions roll back the optimistic token mode",
+);
+eq(
+  appSource.includes("!state.backendActivationPending && !runtimeTransitioning"),
+  true,
+  "runtime profile transitions keep submit behind the controller-ready gate",
+);
+eq(
+  /await continueDelivery\(\{[\s\S]{0,240}goal: state\.meta\?\.goal,[\s\S]{0,240}resumeGoal: resumeControllerGoalForTab,/.test(appSource),
+  true,
+  "delivery recovery routes through continueDelivery with the backend Goal state",
+);
+eq(
+  /await applyGoal\(trimmed\);[\s\S]{0,120}await commitThenSendRef\.current\(sourceTabId/.test(appSource),
+  true,
+  "the first Goal turn waits for the controller Goal before submitting",
+);
 
 const unsent = reducer(sent, { type: "unsend" });
 eq(unsent.pendingUser, undefined, "unsend clears the pending marker");
@@ -189,6 +215,63 @@ replayPendingPromptsForActiveTab("tab-b", () => {
 });
 await new Promise((resolve) => setTimeout(resolve, 0));
 eq(replayCalls, 2, "replay bridge failures are swallowed by the tab-switch effect");
+
+console.log("\ndelivery recovery continuation");
+
+interface ContinueCalls {
+  resumes: string[];
+  sends: string[];
+}
+
+async function runContinueDelivery(opts: {
+  goal: string | undefined;
+  resumed?: boolean;
+  ready?: boolean;
+  tabId?: string | null;
+  tabAfterResume?: string;
+}): Promise<ContinueCalls> {
+  const calls: ContinueCalls = { resumes: [], sends: [] };
+  await continueDelivery({
+    tabId: opts.tabId === undefined ? "tab-a" : opts.tabId,
+    ready: opts.ready ?? true,
+    goal: opts.goal,
+    activeTabId: () => opts.tabAfterResume ?? "tab-a",
+    resumeGoal: (tabId) => {
+      calls.resumes.push(tabId);
+      return Promise.resolve(opts.resumed ?? true);
+    },
+    send: (tabId) => {
+      calls.sends.push(tabId);
+      return Promise.resolve();
+    },
+  });
+  return calls;
+}
+
+const noGoal = await runContinueDelivery({ goal: undefined });
+eq(noGoal.resumes.length, 0, "delivery recovery without a Goal skips the resume call");
+eq(noGoal.sends.join(","), "tab-a", "delivery recovery without a Goal submits the continuation directly");
+
+const blankGoal = await runContinueDelivery({ goal: "   " });
+eq(blankGoal.resumes.length, 0, "delivery recovery treats a blank Goal as absent");
+eq(blankGoal.sends.join(","), "tab-a", "delivery recovery with a blank Goal still submits the continuation");
+
+const goalResumed = await runContinueDelivery({ goal: "ship it", resumed: true });
+eq(goalResumed.resumes.join(","), "tab-a", "delivery recovery with a Goal resumes it first");
+eq(goalResumed.sends.join(","), "tab-a", "delivery recovery submits after the Goal resumes");
+
+const goalRefused = await runContinueDelivery({ goal: "ship it", resumed: false });
+eq(goalRefused.resumes.join(","), "tab-a", "an unresumable Goal is still offered the resume");
+eq(goalRefused.sends.length, 0, "an unresumable (completed) Goal does not submit the continuation");
+
+const tabSwitched = await runContinueDelivery({ goal: "ship it", resumed: true, tabAfterResume: "tab-b" });
+eq(tabSwitched.sends.length, 0, "a tab switch during resume drops the continuation");
+
+const notReady = await runContinueDelivery({ goal: undefined, ready: false });
+eq(notReady.sends.length, 0, "delivery recovery waits for controller readiness");
+
+const noTab = await runContinueDelivery({ goal: undefined, tabId: null });
+eq(noTab.sends.length, 0, "delivery recovery without an active tab is a no-op");
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

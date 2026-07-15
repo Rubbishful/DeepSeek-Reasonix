@@ -237,6 +237,7 @@ func NormalizeMaxSubagentDepth(depth int) int {
 type ToolHooks interface {
 	PreToolUse(ctx context.Context, name string, args json.RawMessage) (block bool, message string)
 	PostToolUse(ctx context.Context, name string, args json.RawMessage, result string)
+	PostToolUseFailure(ctx context.Context, name string, args json.RawMessage, result string, err error)
 	// PostLLMCall fires after each model turn completes (streaming finishes)
 	// but before reasoning_content is stored. It returns the (possibly
 	// translated) reasoning string — the original when no hook is configured.
@@ -388,6 +389,9 @@ type Agent struct {
 	deliveryCriteriaEstablished bool
 	deliveryTaskExpected        bool
 	deliveryMutationExpected    bool
+	deliveryScopeID             string
+	deliveryScopeActive         bool
+	deliveryCheckpoint          evidence.DeliveryCheckpoint
 
 	// classifierTaskText is the host-trusted task text for delivery intent
 	// classification, set by sub-agent spawners whose Run input carries host
@@ -1208,10 +1212,28 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 	a.steerConsumed = false
 	a.steerRunActive = true
 	a.steerMu.Unlock()
-	if a.evidence != nil && !a.preserveEvidenceOnce {
-		a.evidence.Reset()
+	scope, scoped := DeliveryExecutionScopeFromContext(ctx)
+	preserveEvidence := a.preserveEvidenceOnce
+	if a.evidence != nil {
+		switch {
+		case preserveEvidence:
+			a.evidence.ResetBackgroundLeases()
+		case scoped && a.deliveryScopeID == scope.ID:
+			a.evidence.ResetBackgroundLeases()
+		default:
+			a.evidence.Reset()
+		}
 	}
 	a.preserveEvidenceOnce = false
+	if scoped {
+		a.deliveryScopeID = scope.ID
+	} else if !preserveEvidence {
+		a.deliveryScopeID = ""
+	}
+	a.deliveryScopeActive = scoped
+	if scoped && a.deliveryCheckpoint.ScopeID != scope.ID {
+		a.deliveryCheckpoint = evidence.DeliveryCheckpoint{ScopeID: scope.ID}
+	}
 	// Re-lease this session's background-job mutations that no turn has
 	// committed yet. The Reset above just wiped any lease a failed or
 	// cancelled turn held (its ledger is gone), and a process restart starts
@@ -1249,7 +1271,12 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 			a.jobs.CommitEvidenceForSession(lease.Session, lease.JobID)
 		}
 	}()
-	a.deliveryCriteriaEstablished = a.hasIncompleteCanonicalCriteria()
+	a.deliveryCriteriaEstablished = a.hasIncompleteCanonicalCriteria() ||
+		(a.evidence != nil && a.evidence.HasSuccessfulTodoWrite()) ||
+		(scoped && a.deliveryCheckpoint.CriteriaEstablished)
+	if scoped {
+		defer func() { a.updateDeliveryCheckpoint(runErr) }()
+	}
 	// Classify delivery expectations from the task text. Sub-agent spawners
 	// pass the pristine task through Options.ClassifierTaskText (a trusted
 	// host channel) because their Run input carries host framing whose
@@ -1259,7 +1286,9 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 	// classified verbatim: stripping user-controllable markup here would let
 	// input dressed up as host framing disarm the delivery gates.
 	classifierInput := a.classifierTaskText
-	if strings.TrimSpace(classifierInput) == "" {
+	if scoped && strings.TrimSpace(scope.TaskText) != "" {
+		classifierInput = scope.TaskText
+	} else if strings.TrimSpace(classifierInput) == "" {
 		classifierInput = rawInput
 	}
 	a.deliveryTaskExpected = deliveryTaskNeedsEvidence(classifierInput)
@@ -1400,7 +1429,8 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 		})
 
 		if len(calls) == 0 {
-			readiness := a.finalReadinessCheck()
+			finalizeTask := !a.deliveryScopeActive || deliveryDisposition(text) == deliveryGoalFinal
+			readiness := a.finalReadinessCheckFor(finalizeTask)
 			if readiness.reason != "" {
 				// A block only counts against the base budget when the model made
 				// no host-observable progress since the previous block. A turn that
@@ -1562,7 +1592,7 @@ func (a *Agent) emitMemoryCompilerStats(turn *memorycompiler.Turn) {
 }
 
 func (a *Agent) finalReadinessFailure() string {
-	return a.finalReadinessCheck().reason
+	return a.finalReadinessCheckFor(true).reason
 }
 
 // GoalReadinessFailure returns the final-readiness failure reason — a summary of
@@ -1602,12 +1632,37 @@ func (c finalReadinessCheck) audit(result evidence.ReadinessAuditResult, recover
 }
 
 func (a *Agent) finalReadinessCheck() finalReadinessCheck {
+	return a.finalReadinessCheckFor(true)
+}
+
+func (a *Agent) finalReadinessCheckFor(finalizeTask bool) finalReadinessCheck {
 	if a.evidence == nil {
 		return finalReadinessCheck{}
 	}
 	var missing []string
 	out := finalReadinessCheck{}
-	if !a.planMode.Load() {
+	// Planning returns a proposal to the controller, which owns the approval
+	// gate and starts a fresh execution turn after plan mode is disabled. Applying
+	// delivery execution requirements here would demand mutations that plan mode
+	// itself blocks, preventing the proposal from ever reaching that approval.
+	// Explicit capability requirements still apply because read-only skills and
+	// tools may be required to produce the plan itself. The loop-guard pass
+	// applies here as in execution: a required capability that plan mode itself
+	// blocks can never succeed, so once a loop guard fires the model must be
+	// free to report the blocker instead of exhausting readiness retries.
+	if a.planMode.Load() {
+		if a.deliveryProfile {
+			if msg := a.capabilityGateFailure(); msg != "" {
+				out.applies = true
+				if a.loopGuardAllowsFinal() {
+					return out
+				}
+				out.reason = msg
+			}
+		}
+		return out
+	}
+	if finalizeTask {
 		incomplete, hasTodos := a.evidence.IncompleteLatestTodos()
 		if !hasTodos && a.evidence.HasAnySuccessfulReceipt() {
 			incomplete, hasTodos = a.incompleteCanonicalTodos()
@@ -1621,16 +1676,27 @@ func (a *Agent) finalReadinessCheck() finalReadinessCheck {
 	writer, hasWriter := a.evidence.LatestSuccessfulWriterIndex()
 	deliveryMutation := false
 	deliveryVerificationOnly := false
+	checkpoint := a.deliveryCheckpoint
+	checkpointApplies := a.deliveryScopeActive && checkpoint.ScopeID == a.deliveryScopeID
 	if a.deliveryProfile {
 		if mutation, ok := a.evidence.LatestSuccessfulMutationIndex(); ok {
 			writer, hasWriter = mutation, true
 			deliveryMutation = true
+		} else if checkpointApplies && checkpoint.PendingMutation {
+			// The mutation happened before a controller rebuild/restart. Treat it as
+			// the baseline so this run can satisfy verification/review/sign-off
+			// without manufacturing another write.
+			writer, hasWriter = -1, true
+			deliveryMutation = true
+		} else if checkpointApplies && checkpoint.MutationObserved {
+			deliveryMutation = true
 		}
-		if a.deliveryTaskExpected && !a.evidence.HasSuccessfulWorkReceipt() {
+		workObserved := a.evidence.HasSuccessfulWorkReceipt() || (checkpointApplies && checkpoint.WorkObserved)
+		if finalizeTask && a.deliveryTaskExpected && !workObserved {
 			out.missingActionEvidence++
 			missing = append(missing, "perform host-observable work for this technical task before answering")
 		}
-		if a.deliveryMutationExpected && !deliveryMutation {
+		if finalizeTask && a.deliveryMutationExpected && !deliveryMutation {
 			out.missingMutation++
 			missing = append(missing, "the request requires a state change, but no successful mutation was observed")
 		}
@@ -1641,9 +1707,11 @@ func (a *Agent) finalReadinessCheck() finalReadinessCheck {
 		// Required/preferred capability gates apply before the no-writer fast
 		// path below: a user-required Skill/MCP must not be skippable by
 		// answering from ordinary reads alone.
-		if msg := a.capabilityGateFailure(); msg != "" {
-			out.applies = true
-			missing = append(missing, msg)
+		if finalizeTask {
+			if msg := a.capabilityGateFailure(); msg != "" {
+				out.applies = true
+				missing = append(missing, msg)
+			}
 		}
 	}
 	if !hasWriter {
@@ -1662,7 +1730,8 @@ func (a *Agent) finalReadinessCheck() finalReadinessCheck {
 	}
 	out.applies = true
 	if a.deliveryProfile {
-		if !a.deliveryCriteriaEstablished {
+		criteriaEstablished := a.deliveryCriteriaEstablished || (checkpointApplies && checkpoint.CriteriaEstablished)
+		if !criteriaEstablished {
 			out.missingAcceptanceCriteria++
 			missing = append(missing, "establish concrete acceptance criteria with todo_write before changing state")
 		}
@@ -1707,6 +1776,57 @@ func (a *Agent) finalReadinessCheck() finalReadinessCheck {
 	}
 	out.reason = strings.Join(missing, "; ")
 	return out
+}
+
+// DeliveryCheckpoint returns the compact Goal-scoped delivery state. It is safe
+// to persist next to the Goal sidecar because it contains no raw arguments.
+func (a *Agent) DeliveryCheckpoint() evidence.DeliveryCheckpoint {
+	return a.deliveryCheckpoint
+}
+
+// RestoreDeliveryCheckpoint seeds a rebuilt controller before its next Goal
+// run. A mismatched/empty scope is ignored conservatively.
+func (a *Agent) RestoreDeliveryCheckpoint(checkpoint evidence.DeliveryCheckpoint) {
+	checkpoint.ScopeID = strings.TrimSpace(checkpoint.ScopeID)
+	if checkpoint.ScopeID == "" {
+		return
+	}
+	a.deliveryCheckpoint = checkpoint
+	a.deliveryScopeID = checkpoint.ScopeID
+}
+
+func (a *Agent) updateDeliveryCheckpoint(runErr error) {
+	if !a.deliveryScopeActive || a.deliveryScopeID == "" || a.evidence == nil {
+		return
+	}
+	cp := a.deliveryCheckpoint
+	if cp.ScopeID != a.deliveryScopeID {
+		cp = evidence.DeliveryCheckpoint{ScopeID: a.deliveryScopeID}
+	}
+	cp.CriteriaEstablished = cp.CriteriaEstablished || a.deliveryCriteriaEstablished || a.evidence.HasSuccessfulTodoWrite()
+	cp.WorkObserved = cp.WorkObserved || a.evidence.HasSuccessfulWorkReceipt()
+	if _, ok := a.evidence.LatestSuccessfulMutationIndex(); ok {
+		cp.MutationObserved = true
+		cp.PendingMutation = true
+	}
+	if runErr == nil && cp.PendingMutation && a.deliveryMutationCheckpointReady() {
+		cp.PendingMutation = false
+	}
+	a.deliveryCheckpoint = cp
+}
+
+func (a *Agent) deliveryMutationCheckpointReady() bool {
+	if a.evidence == nil || !a.deliveryCriteriaEstablished {
+		return false
+	}
+	mutation, ok := a.evidence.LatestSuccessfulMutationIndex()
+	if !ok {
+		mutation = -1
+	}
+	return a.evidence.HasSuccessfulCompleteStepAfter(mutation) &&
+		a.evidence.HasSuccessfulDeliverySignoffAfter(mutation) &&
+		a.evidence.HasSuccessfulReviewAfter(mutation) &&
+		a.deliveryReviewGateFailure() == ""
 }
 
 // armLoopGuardPass records that a loop guard fired this user turn.
@@ -3024,10 +3144,14 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 	}
 	// Track skill/capability outcomes for Delivery gates.
 	a.noteCapabilityInvocation(call.Name, json.RawMessage(call.Arguments), err)
-	// PostToolUse hooks observe the result (they can't block); fired whether the
-	// call succeeded or errored, since the tool did run. Use real target name.
+	// Success and failure hooks observe the result after the tool ran. Use the
+	// real target name for proxied tools.
 	if a.hooks != nil {
-		a.hooks.PostToolUse(ctx, permName, permArgs, result)
+		if err != nil {
+			a.hooks.PostToolUseFailure(ctx, permName, permArgs, result, err)
+		} else {
+			a.hooks.PostToolUse(ctx, permName, permArgs, result)
+		}
 	}
 	if err != nil {
 		detail := result

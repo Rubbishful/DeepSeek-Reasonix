@@ -121,7 +121,7 @@ func (m *chatTUI) runWorkModeCommand(input string) tea.Cmd {
 			RuntimeProfile:   target,
 			ToolApprovalMode: oldCtrl.ToolApprovalMode(),
 			PlanMode:         oldCtrl.PlanMode(),
-		}, carried, resumePath)
+		}, carried, resumePath, oldCtrl)
 		if err != nil {
 			return modelSwitchMsg{
 				ref:           ref,

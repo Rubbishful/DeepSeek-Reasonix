@@ -1159,3 +1159,61 @@ func TestSessionRotationClearsActiveGoal(t *testing.T) {
 		t.Fatalf("old goal leaked into the cleared session's turn: %q", composed)
 	}
 }
+
+func TestGoalSidecarRoundTripPreservesBlockedDeliveryCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	exec := agent.New(nil, nil, agent.NewSession("sys"), agent.Options{}, event.Discard)
+	c := New(Options{Executor: exec, SessionDir: dir, SessionPath: path, Label: "test"})
+	c.SetGoal("finish the delivery")
+	scopeID, _, ok := c.goals.deliveryScope()
+	if !ok || scopeID == "" {
+		t.Fatal("Goal did not allocate a delivery scope")
+	}
+	cp := evidence.DeliveryCheckpoint{
+		ScopeID:             scopeID,
+		CriteriaEstablished: true,
+		WorkObserved:        true,
+		MutationObserved:    true,
+		PendingMutation:     true,
+	}
+	statePath, data, persist := c.goals.setDeliveryCheckpoint(cp, nil)
+	c.persistGoalState(statePath, data, persist)
+	c.stopGoal(GoalStatusBlocked)
+
+	freshExec := agent.New(nil, nil, agent.NewSession("sys"), agent.Options{}, event.Discard)
+	fresh := New(Options{Executor: freshExec, SessionDir: dir, Label: "fresh"})
+	fresh.Resume(agent.NewSession("sys"), path)
+	if fresh.Goal() != "finish the delivery" || fresh.GoalStatus() != GoalStatusBlocked {
+		t.Fatalf("restored Goal = (%q, %q), want blocked Goal", fresh.Goal(), fresh.GoalStatus())
+	}
+	if got := freshExec.DeliveryCheckpoint(); got != cp {
+		t.Fatalf("restored checkpoint = %+v, want %+v", got, cp)
+	}
+	if !fresh.ResumeGoal() {
+		t.Fatal("ResumeGoal rejected a restored blocked Goal")
+	}
+	id, _, ok := fresh.goals.deliveryScope()
+	if !ok || id != scopeID {
+		t.Fatalf("resumed scope = %q, want %q", id, scopeID)
+	}
+}
+
+func TestLegacyRunningGoalSidecarAllocatesScope(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legacy.jsonl")
+	data := []byte(`{"goal":"legacy goal","status":"running"}`)
+	if err := os.WriteFile(store.SessionGoalState(path), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exec := agent.New(nil, nil, agent.NewSession("sys"), agent.Options{}, event.Discard)
+	c := New(Options{Executor: exec, SessionDir: dir, Label: "test"})
+	c.Resume(agent.NewSession("sys"), path)
+	id, task, ok := c.goals.deliveryScope()
+	if !ok || id == "" || task != "legacy goal" {
+		t.Fatalf("legacy delivery scope = (%q, %q, %v)", id, task, ok)
+	}
+	if got := exec.DeliveryCheckpoint(); got.ScopeID != id {
+		t.Fatalf("legacy checkpoint scope = %q, want %q", got.ScopeID, id)
+	}
+}

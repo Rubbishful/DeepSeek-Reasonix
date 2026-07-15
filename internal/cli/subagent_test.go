@@ -10,6 +10,7 @@ import (
 	"reasonix/internal/config"
 	"reasonix/internal/control"
 	"reasonix/internal/event"
+	"reasonix/internal/pluginpkg"
 	"reasonix/internal/skill"
 )
 
@@ -82,6 +83,43 @@ func TestSubagentProfileCLIManageRoundTrip(t *testing.T) {
 	}
 	if _, ok := store.Read("helper"); ok {
 		t.Fatal("confirmed delete left profile behind")
+	}
+}
+
+func TestSubagentListIncludesQualifiedPluginAgents(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("REASONIX_HOME", home)
+	project := t.TempDir()
+	t.Chdir(project)
+	root := filepath.Join(home, "plugins", "commercial-legal")
+	writePluginTestFile(t, filepath.Join(root, pluginpkg.ClaudeManifest), `{"name":"commercial-legal"}`)
+	writePluginTestFile(t, filepath.Join(root, "agents", "deal-debrief.md"), `---
+description: Debrief a completed deal
+model: sonnet
+tools: ["Read", "Write", "mcp__*__search"]
+---
+Debrief the deal.`)
+	if err := pluginpkg.Upsert(home, pluginpkg.InstalledPlugin{
+		Name: "commercial-legal", Root: "plugins/commercial-legal", ManifestKind: "claude", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	store := newCLISubagentStore()
+	sk, ok := store.ReadSlash("commercial-legal:agent:deal-debrief")
+	if !ok || sk.RunAs != skill.RunSubagent || sk.Invocation != "manual" || sk.Model != "" {
+		t.Fatalf("plugin agent = %+v, found=%v", sk, ok)
+	}
+	if got := strings.Join(sk.AllowedTools, ","); got != "read_file,write_file,mcp__*__search" {
+		t.Fatalf("allowed tools = %q", got)
+	}
+	out := captureStdout(t, func() {
+		if rc := subagentCommand([]string{"list"}); rc != 0 {
+			t.Fatalf("list rc = %d", rc)
+		}
+	})
+	if !strings.Contains(out, "commercial-legal:agent:deal-debrief") || !strings.Contains(out, "custom, manual") {
+		t.Fatalf("list output = %q", out)
 	}
 }
 

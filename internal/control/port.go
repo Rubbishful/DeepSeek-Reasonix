@@ -94,6 +94,7 @@ type Goals interface {
 	GoalStatus() string
 	SetGoal(goal string)
 	SetGoalWithResearchMode(goal string, researchMode GoalResearchMode)
+	ResumeGoal() bool
 	GoalStrict(strict bool)
 	ClearGoal()
 	AutoResearchSummary() (*autoresearch.Summary, bool)

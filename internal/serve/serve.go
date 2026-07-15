@@ -198,7 +198,34 @@ func (s *Server) switchModel(ctx context.Context, ref string) error {
 	// Keep the carried conversation in its existing file so the switch doesn't
 	// orphan a duplicate (#2807).
 	newPath := agent.ContinueSessionPath(prevPath, newCtrl.SessionDir(), newCtrl.Label())
+	// The freshly built controller's own leading system message carries the
+	// target profile's contract; AdoptHistory below replaces the whole
+	// history with carried, so splice that message in first or the model
+	// keeps seeing the outgoing profile's contract after every switch.
+	if fresh := newCtrl.History(); len(fresh) > 0 && fresh[0].Role == provider.RoleSystem {
+		if len(carried) > 0 && carried[0].Role == provider.RoleSystem {
+			carried[0] = fresh[0]
+		} else {
+			carried = append([]provider.Message{fresh[0]}, carried...)
+		}
+	}
 	newCtrl.AdoptHistory(carried, newPath)
+	// A rebuild must not force the user to re-approve tools already granted
+	// this session, or re-trust Plan-mode read-only commands already trusted
+	// this session.
+	if prev, ok := cur.(*control.Controller); ok {
+		newCtrl.RestoreSessionAuthorizations(prev.SessionAuthorizations())
+	}
+	// Persist before publishing the replacement. A failed write leaves cur and
+	// the on-disk transcript coherent and lets the caller retry; publishing first
+	// would report a successful switch whose refreshed system contract disappears
+	// on restart. AdoptHistory retained the loaded CAS baseline for this rewrite.
+	if newPath != "" {
+		if err := newCtrl.Snapshot(); err != nil {
+			newCtrl.Close()
+			return fmt.Errorf("switch model: snapshot adopted history: %w", err)
+		}
+	}
 
 	// Publish the swap under a short write lock. bindMu already serializes
 	// switches — today the only writer of s.ctrl — so the identity re-check is

@@ -37,6 +37,7 @@ import type {
   DroppedItem,
   EffortInfo,
   FilePreview,
+  ExternalOpenersView,
   HistoryMessage,
   HistoryPage,
   HookConfigView,
@@ -156,14 +157,18 @@ export interface AppBindings {
   ReplayPendingPrompts(): Promise<void>;
   SetPlanMode(on: boolean): Promise<void>;
   SetMode(mode: string): Promise<void>;
-  SetModeForTab(tabID: string, mode: string): Promise<void>;
+  // Resolves with the pending approval prompt ids the switch auto-allowed
+  // (drained); prompts not listed are still pending backend-side (#6432).
+  SetModeForTab(tabID: string, mode: string): Promise<string[] | void>;
   SetAutoApproveTools(on: boolean): Promise<void>;
   SetCollaborationMode(mode: string): Promise<void>;
   SetCollaborationModeForTab(tabID: string, mode: string): Promise<void>;
   SetToolApprovalMode(mode: string): Promise<void>;
-  SetToolApprovalModeForTab(tabID: string, mode: string): Promise<void>;
+  // Same drained-prompt-id contract as SetModeForTab.
+  SetToolApprovalModeForTab(tabID: string, mode: string): Promise<string[] | void>;
   SetGoal(goal: string): Promise<void>;
   SetGoalForTab(tabID: string, goal: string): Promise<void>;
+  ResumeGoalForTab(tabID: string): Promise<boolean>;
   ClearGoal(): Promise<void>;
   ClearGoalForTab(tabID: string): Promise<void>;
   Compact(): Promise<void>;
@@ -273,6 +278,10 @@ export interface AppBindings {
   WorkspaceGitCommitDetail(tabID: string, hash: string, path: string): Promise<GitCommitDetailView>;
   OpenWorkspacePath(rel: string): Promise<void>;
   OpenWorkspacePathForTab(tabID: string, rel: string): Promise<void>;
+  ExternalOpeners(): Promise<ExternalOpenersView>;
+  SetPreferredExternalOpener(id: string): Promise<void>;
+  OpenWorkspaceInExternalOpener(id: string): Promise<void>;
+  OpenWorkspaceInExternalOpenerForTab(tabID: string, id: string): Promise<void>;
   RevealWorkspacePath(rel: string): Promise<void>;
   RevealWorkspacePathForTab(tabID: string, rel: string): Promise<void>;
   RevealPath(path: string): Promise<void>;
@@ -930,6 +939,11 @@ function cloneMockProviderTemplate(id: string, key: string): ProviderView | unde
 const mockPreviewImageDataURL =
   "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='120' viewBox='0 0 160 120'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23f97316'/%3E%3Cstop offset='1' stop-color='%232563eb'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='160' height='120' rx='14' fill='url(%23g)'/%3E%3Ccircle cx='44' cy='38' r='16' fill='%23fff7ed' opacity='.9'/%3E%3Cpath d='M18 96 62 58l24 22 18-16 38 32z' fill='%23ffffff' opacity='.9'/%3E%3C/svg%3E";
 
+function mockExternalOpenerIconDataURL(color: string, label: string): string {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="${color}"/><text x="32" y="40" text-anchor="middle" font-family="system-ui" font-size="25" font-weight="700" fill="white">${label}</text></svg>`;
+  return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+}
+
 function makeMockApp(): AppBindings {
   const scenario = mockScenario();
   const freshMock = scenario === "fresh";
@@ -941,6 +955,10 @@ function makeMockApp(): AppBindings {
   let cancelled = false;
   let pendingAskPreview = false;
   let pendingApprovalPreview = false;
+  // Mirrors the last emitted approval preview so mode switches can mirror the
+  // backend drain contract: only non-fresh tools auto-allow; plan/sandbox
+  // escape prompts stay pending and visible.
+  let pendingApprovalPreviewPrompt: { id: string; tool: string } | undefined;
   const globalWorkspaceRoot = "~/Library/Application Support/reasonix/global-workspace";
   let cwd = freshMock ? globalWorkspaceRoot : "~/projects/joyquant-db"; // mutable so PickWorkspace is visible in dev
   let workspaces = freshMock ? [] : ["~/projects/joyquant-db", "~/projects/joyquant-sys", "~/projects/reasonix", "~/projects/blade"];
@@ -1602,6 +1620,7 @@ function makeMockApp(): AppBindings {
         }
         if (tab.topicId === "topic_sys_coord") {
           pendingApprovalPreview = true;
+          pendingApprovalPreviewPrompt = { id: "mock-sys-confirm", tool: "bash" };
           emit({ kind: "reasoning", text: "我已经准备好执行同步脚本，但这个操作会影响本地 workspace，需要用户确认。" });
           await delay(160);
           emit({
@@ -1631,6 +1650,21 @@ function makeMockApp(): AppBindings {
   const emitMockTurnDone = () => {
     setMockTabRunning(currentMockTurnTabId(), false);
     emit({ kind: "turn_done" });
+  };
+  // Fresh user decisions never auto-allow on a posture switch (mirrors the
+  // backend's requiresFreshApprovalTool set).
+  const mockFreshApprovalTools = new Set(["exit_plan_mode", "sandbox_escape", "memory_remember", "memory_forget", "managed_config_write"]);
+  // Mirrors the backend drain contract for the mode-switch bindings: returns
+  // the prompt ids the new posture auto-allowed; fresh prompts stay pending.
+  const drainMockApprovalPreviews = (toolApprovalMode: string): string[] => {
+    if (toolApprovalMode !== "auto" && toolApprovalMode !== "yolo") return [];
+    const prompt = pendingApprovalPreviewPrompt;
+    if (!pendingApprovalPreview || !prompt || mockFreshApprovalTools.has(prompt.tool)) return [];
+    pendingApprovalPreview = false;
+    pendingApprovalPreviewPrompt = undefined;
+    emit({ kind: "message", text: `approval preview auto-allowed (${toolApprovalMode})` });
+    emitMockTurnDone();
+    return [prompt.id];
   };
   let mockTabs: TabMeta[] = noticePreviewMock ? [
     {
@@ -1736,6 +1770,7 @@ function makeMockApp(): AppBindings {
     window.setTimeout(() => {
       if (pendingApprovalPreview) return;
       pendingApprovalPreview = true;
+      pendingApprovalPreviewPrompt = { id: "mock-sandbox-escape-preview", tool: "sandbox_escape" };
       emitMockTurnStarted();
       emit({ kind: "reasoning", text: t("mock.sandboxEscapeReasoning") });
       emit({
@@ -1833,6 +1868,7 @@ function makeMockApp(): AppBindings {
       }
       if (trimmedInput === "/approve-preview" || trimmedInput === "approve preview" || trimmedInput === "approve预览") {
         pendingApprovalPreview = true;
+        pendingApprovalPreviewPrompt = { id: "mock-approval-preview", tool: "bash" };
         await delay(250);
         if (cancelled) return;
         emit({
@@ -1852,6 +1888,7 @@ function makeMockApp(): AppBindings {
         trimmedInput === "sandbox escape预览"
       ) {
         pendingApprovalPreview = true;
+        pendingApprovalPreviewPrompt = { id: "mock-sandbox-escape-preview", tool: "sandbox_escape" };
         await delay(250);
         if (cancelled) return;
         emit({
@@ -1871,6 +1908,7 @@ function makeMockApp(): AppBindings {
         trimmedInput === "plan approve预览"
       ) {
         pendingApprovalPreview = true;
+        pendingApprovalPreviewPrompt = { id: "mock-plan-approval-preview", tool: "exit_plan_mode" };
         await delay(250);
         if (cancelled) return;
         emit({
@@ -2146,6 +2184,7 @@ function makeMockApp(): AppBindings {
         async Approve(_id, allow, session, persist) {
           if (!pendingApprovalPreview) return;
           pendingApprovalPreview = false;
+          pendingApprovalPreviewPrompt = undefined;
           const suffix = persist ? "grant saved" : session ? "grant active this session" : "allowed once";
           emit({
             kind: "message",
@@ -2183,16 +2222,18 @@ function makeMockApp(): AppBindings {
         },
         async SetModeForTab(tabID, mode) {
           const nextMode = normalizeMode(mode);
-          mockTabs = mockTabs.map((tab) =>
-            tab.id === tabID
-              ? {
-                  ...tab,
-                  mode: nextMode,
-                  collaborationMode: normalizeCollaborationMode(undefined, tab.goal, nextMode),
-                  toolApprovalMode: mockToolApprovalModeAfterModeChange(tab.toolApprovalMode, nextMode),
-                }
-              : tab,
-          );
+          let nextToolApprovalMode: ToolApprovalMode | "" = "";
+          mockTabs = mockTabs.map((tab) => {
+            if (tab.id !== tabID) return tab;
+            nextToolApprovalMode = mockToolApprovalModeAfterModeChange(tab.toolApprovalMode, nextMode);
+            return {
+              ...tab,
+              mode: nextMode,
+              collaborationMode: normalizeCollaborationMode(undefined, tab.goal, nextMode),
+              toolApprovalMode: nextToolApprovalMode,
+            };
+          });
+          return drainMockApprovalPreviews(nextToolApprovalMode);
         },
         async SetCollaborationMode(mode) {
           const active = mockTabs.find((tab) => tab.active);
@@ -2228,6 +2269,7 @@ function makeMockApp(): AppBindings {
                 }
               : tab,
           );
+          return drainMockApprovalPreviews(next);
         },
         async SetGoal(goal) {
           const active = mockTabs.find((tab) => tab.active);
@@ -2246,6 +2288,15 @@ function makeMockApp(): AppBindings {
                 }
               : tab,
           );
+        },
+        async ResumeGoalForTab(tabID) {
+          let resumed = false;
+          mockTabs = mockTabs.map((tab) => {
+            if (tab.id !== tabID || !tab.goal || tab.goalStatus === "complete") return tab;
+            resumed = true;
+            return { ...tab, goalStatus: "running", collaborationMode: "goal" };
+          });
+          return resumed;
         },
         async ClearGoal() {
           await this.SetGoal("");
@@ -3093,6 +3144,22 @@ function makeMockApp(): AppBindings {
     },
     async OpenWorkspacePathForTab(_tabID: string, rel: string) {
       await this.OpenWorkspacePath(rel);
+    },
+    async ExternalOpeners() {
+      return {
+        openers: [
+          { id: "vscode", name: "VS Code", kind: "editor", iconDataUrl: mockExternalOpenerIconDataURL("#1684d6", "V") },
+          { id: "cursor", name: "Cursor", kind: "editor", iconDataUrl: mockExternalOpenerIconDataURL("#25262a", "C") },
+          { id: "finder", name: "Finder", kind: "file-manager", iconDataUrl: mockExternalOpenerIconDataURL("#36aaf4", "F") },
+          { id: "ghostty", name: "Ghostty", kind: "terminal", iconDataUrl: mockExternalOpenerIconDataURL("#264db6", ">") },
+        ],
+        preferred: "vscode",
+      } as ExternalOpenersView;
+    },
+    async SetPreferredExternalOpener(_id: string) {},
+    async OpenWorkspaceInExternalOpener(_id: string) {},
+    async OpenWorkspaceInExternalOpenerForTab(_tabID: string, id: string) {
+      await this.OpenWorkspaceInExternalOpener(id);
     },
     async RevealWorkspacePath(rel: string) {
       console.info("mock RevealWorkspacePath", rel);

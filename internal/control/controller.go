@@ -466,6 +466,9 @@ func New(opts Options) *Controller {
 	if runtimeProfile == "" {
 		runtimeProfile = capability.ProfileBalanced
 	}
+	if opts.Hooks != nil {
+		opts.Hooks.SetSessionID(agent.BranchID(opts.SessionPath))
+	}
 	c := &Controller{
 		runner:                            opts.Runner,
 		executor:                          opts.Executor,
@@ -1627,7 +1630,7 @@ func (c *Controller) noticeDetail(text, detail string) {
 // Run executes a turn synchronously, returning the agent's error. Used by the
 // headless `reasonix run` path, where the Sink renders to stdout and the caller
 // just needs the exit status — no TurnDone event, no cancel bookkeeping.
-func (c *Controller) Run(ctx context.Context, input string) error {
+func (c *Controller) Run(ctx context.Context, input string) (err error) {
 	c.maybeSessionStart(ctx)
 	parentSession := c.parentSessionID()
 	ctx = agent.WithParentSession(ctx, parentSession)
@@ -1648,11 +1651,12 @@ func (c *Controller) Run(ctx context.Context, input string) error {
 		if block, _ := c.hooks.PromptSubmit(ctx, input, turn); block {
 			return nil
 		}
-		defer func() { c.hooks.Stop(context.Background(), lastAssistantText(c.History()), turn) }()
+		defer func() { c.hooks.StopResult(context.Background(), lastAssistantText(c.History()), turn, err) }()
 	}
 	c.markInFlightTurn(startMessages, true)
 	defer c.clearInFlightTurn()
-	return c.runner.Run(ctx, c.withCapabilityRoute(input, rawInput))
+	err = c.runner.Run(ctx, c.withCapabilityRoute(input, rawInput))
+	return err
 }
 
 // RunSubagentProfile executes one named runAs=subagent skill synchronously and
@@ -2190,6 +2194,29 @@ func (c *Controller) SetGoalWithResearchMode(goal string, researchMode GoalResea
 	}
 }
 
+// ResumeGoal re-enters a recoverable blocked/stopped Goal without resetting its
+// delivery evidence scope or AutoResearch identity.
+func (c *Controller) ResumeGoal() bool {
+	path, data, persist, resumed := c.goals.resume(c.goalTodos())
+	if !resumed {
+		return false
+	}
+	c.persistGoalState(path, data, persist)
+	if c.executor != nil {
+		c.executor.RestoreDeliveryCheckpoint(c.goals.deliveryState())
+	}
+	return true
+}
+
+func (c *Controller) persistGoalDeliveryCheckpoint() {
+	if c.executor == nil {
+		return
+	}
+	checkpoint := c.executor.DeliveryCheckpoint()
+	path, data, ok := c.goals.setDeliveryCheckpoint(checkpoint, c.goalTodos())
+	c.persistGoalState(path, data, ok)
+}
+
 func (c *Controller) ensureAutoResearchTask(goal string, researchMode GoalResearchMode) (string, string) {
 	goal = strings.TrimSpace(goal)
 	if goal == "" || c.autoResearch == nil || !shouldUseAutoResearch(goal, researchMode) {
@@ -2555,6 +2582,7 @@ func (c *Controller) Compact(ctx context.Context, instructions string) error {
 // on the first turn — by then the sink/notify is wired, and a resumed session
 // fires it too (its first post-resume turn).
 func (c *Controller) maybeSessionStart(ctx context.Context) {
+	c.hooks.SetSessionID(c.parentSessionID())
 	c.mu.Lock()
 	if c.startedOnce {
 		c.mu.Unlock()
@@ -2584,7 +2612,7 @@ func (c *Controller) NewSession() error {
 	if err := c.Snapshot(); err != nil {
 		return err
 	}
-	c.hooks.SessionEnd(context.Background())
+	c.hooks.SessionEnd(context.Background(), "clear")
 	// Hold snapshotMu across the swap so an in-flight save cannot pair the old
 	// path with the fresh session (or the fresh path with the old session).
 	c.snapshotMu.Lock()
@@ -2611,7 +2639,8 @@ func (c *Controller) NewSession() error {
 	c.mu.Lock()
 	c.startedOnce = true // NewSession fires SessionStart itself; don't re-fire on the next turn
 	c.mu.Unlock()
-	c.enqueueHookContexts(c.hooks.SessionStart(context.Background()))
+	c.hooks.SetSessionID(c.parentSessionID())
+	c.enqueueHookContexts(c.hooks.SessionStart(context.Background(), "clear"))
 	return nil
 }
 
@@ -2653,7 +2682,7 @@ func (c *Controller) ClearSession() error {
 		}
 		destroy.Finish()
 	}
-	c.hooks.SessionEnd(context.Background())
+	c.hooks.SessionEnd(context.Background(), "clear")
 	if c.sessionDir != "" {
 		c.mu.Lock()
 		c.sessionPath = agent.NewSessionPath(c.sessionDir, c.label)
@@ -2673,7 +2702,8 @@ func (c *Controller) ClearSession() error {
 	c.mu.Lock()
 	c.startedOnce = true
 	c.mu.Unlock()
-	c.enqueueHookContexts(c.hooks.SessionStart(context.Background()))
+	c.hooks.SetSessionID(c.parentSessionID())
+	c.enqueueHookContexts(c.hooks.SessionStart(context.Background(), "clear"))
 	if destroy.Async {
 		go func() {
 			result := destroy.Wait()
@@ -3170,7 +3200,10 @@ func (c *Controller) Resume(s *agent.Session, path string) {
 	c.mu.Unlock()
 	c.setActiveJobSession(path)
 	c.rebindCheckpoints(path)
-	c.goals.restoreRunningFromState(path)
+	c.goals.restoreFromState(path)
+	if c.executor != nil {
+		c.executor.RestoreDeliveryCheckpoint(c.goals.deliveryState())
+	}
 	c.restoreTerminalGoalTodos(path)
 	c.loadGuardianSession()
 	c.snapshotMu.Unlock()
@@ -4413,6 +4446,22 @@ func (c *Controller) InheritLifecycleFrom(prev *Controller) {
 	c.mu.Unlock()
 }
 
+// SessionAuthorizations snapshots this controller's same-session tool
+// grants ("Allow for this session") and Plan-mode read-only command trust,
+// for carrying into a replacement controller across a rebuild — see
+// RestoreSessionAuthorizations.
+func (c *Controller) SessionAuthorizations() SessionAuthorizations {
+	return c.approval.snapshotSessionAuthorizations()
+}
+
+// RestoreSessionAuthorizations re-applies session authorizations captured
+// from a prior controller in the same session (see SessionAuthorizations). A
+// model/effort/profile switch rebuilds the controller, and without this the
+// replacement forgets every grant the user already made this session.
+func (c *Controller) RestoreSessionAuthorizations(auth SessionAuthorizations) {
+	c.approval.restoreSessionAuthorizations(auth)
+}
+
 // ReleaseResources stops plugin subprocesses and releases resources without
 // firing SessionEnd. Use it only when replacing the controller for the same
 // logical session.
@@ -4457,7 +4506,7 @@ func (c *Controller) close(fireSessionEnd bool, jobsMode closeJobsMode) {
 		c.parkedTurns = nil
 		c.mu.Unlock()
 		if fireSessionEnd && started {
-			c.hooks.SessionEnd(context.Background())
+			c.hooks.SessionEnd(context.Background(), "other")
 		}
 		if c.jobs != nil {
 			switch jobsMode {
@@ -4490,15 +4539,28 @@ func (c *Controller) Jobs() []jobs.View {
 // executor's gate and leave sub-agents pinned to whatever mode was active
 // when the session booted.
 func (c *Controller) SetToolApprovalMode(mode string) {
+	c.ApplyToolApprovalMode(mode)
+}
+
+// ApplyToolApprovalMode is SetToolApprovalMode reporting which pending
+// approval prompt ids the new posture auto-allowed. Prompts NOT in the
+// returned set are still pending here — fresh user decisions (plan, memory,
+// sandbox escape) never drain, and auto keeps approvals an allow policy would
+// not cover — so a frontend must keep showing them instead of assuming the
+// posture switch resolved everything (#6432).
+func (c *Controller) ApplyToolApprovalMode(mode string) []string {
 	mode = normalizeToolApprovalMode(mode)
 	pending := c.approval.setMode(mode)
 	if c.subagentGate != nil {
 		c.subagentGate.Update(mode)
 	}
 	c.refreshInteractiveGate()
-	for _, reply := range pending {
-		reply <- approvalReply{allow: true}
+	drained := make([]string, 0, len(pending))
+	for _, p := range pending {
+		p.reply <- approvalReply{allow: true}
+		drained = append(drained, p.id)
 	}
+	return drained
 }
 
 func (c *Controller) ToolApprovalMode() string {
@@ -4527,6 +4589,12 @@ func (c *Controller) SetBypass(on bool) {
 // submitted right after a composer mode switch can't observe a half-applied
 // gate. Turning tool auto-approval on drains any pending tool approval.
 func (c *Controller) SetMode(plan, autoApproveTools bool) {
+	c.ApplyMode(plan, autoApproveTools)
+}
+
+// ApplyMode is SetMode reporting which pending approval prompt ids the tool
+// approval switch auto-allowed (see ApplyToolApprovalMode).
+func (c *Controller) ApplyMode(plan, autoApproveTools bool) []string {
 	c.mu.Lock()
 	c.planMode = plan
 	c.mu.Unlock()
@@ -4535,10 +4603,9 @@ func (c *Controller) SetMode(plan, autoApproveTools bool) {
 		c.executor.SetPlanMode(plan)
 	}
 	if autoApproveTools {
-		c.SetToolApprovalMode(ToolApprovalYolo)
-	} else {
-		c.SetToolApprovalMode(ToolApprovalAsk)
+		return c.ApplyToolApprovalMode(ToolApprovalYolo)
 	}
+	return c.ApplyToolApprovalMode(ToolApprovalAsk)
 }
 
 // AutoApproveTools reports whether YOLO/full-access tool auto-approval is on,
@@ -5197,6 +5264,32 @@ func (c *Controller) requestApprovalDecisionWithOptions(ctx context.Context, too
 	if c.approval.preApprovedForDecision(tool, subject, opts.fresh) {
 		return approvalReply{allow: true}, nil
 	}
+
+	// Claude's PermissionRequest contract answers the dialog on the plugin's
+	// behalf (auto-allow/auto-deny) instead of merely observing it, so a
+	// decision here must preempt the prompt rather than just notify — this
+	// runs synchronously and before the dialog is shown. Native Reasonix
+	// PermissionRequest hooks stay advisory-only (see claudePermissionBlocking).
+	//
+	// A hook's auto-allow must never stand in for a fresh human decision:
+	// sandbox escapes, Reasonix config writes, memory remember/forget, and
+	// plan approval (RequiresFreshHumanApprovalTool) are deliberately excluded
+	// from YOLO/auto-approval and Guardian too, so a broadly-matched plugin
+	// hook returning "allow" can't silently rubber-stamp them. A deny still
+	// applies universally — refusing is always safe to honor automatically.
+	if hookSubject, hookArgs, ok := permissionRequestHookPayload(tool, subject, args); ok {
+		if decision, _ := c.hooks.PermissionRequest(ctx, tool, hookSubject, hookArgs); decision != nil {
+			switch {
+			case !*decision:
+				return approvalReply{}, nil
+			case !opts.fresh && !requiresFreshApprovalTool(tool):
+				return approvalReply{allow: true}, nil
+			}
+			// An "allow" opinion on a fresh-human-required decision is
+			// ignored; fall through to the normal interactive prompt.
+		}
+	}
+
 	var id string
 	var reply chan approvalReply
 	if opts.fresh {
@@ -5206,12 +5299,9 @@ func (c *Controller) requestApprovalDecisionWithOptions(ctx context.Context, too
 	}
 
 	c.sink.Emit(event.Event{Kind: event.ApprovalRequest, Approval: event.Approval{ID: id, Tool: tool, Subject: subject, Reason: reason}})
-	if hookSubject, hookArgs, ok := permissionRequestHookPayload(tool, subject, args); ok {
-		go c.hooks.PermissionRequest(ctx, tool, hookSubject, hookArgs)
-	}
 	// The agent now needs the user's attention; a Notification hook can ping an
 	// external channel (desktop notice, phone) while the run blocks on the reply.
-	go c.hooks.Notification(ctx, approvalNotificationText(tool, subject))
+	go c.hooks.Notification(ctx, approvalNotificationText(tool, subject), "permission_prompt")
 
 	waitCtx, cancelWait := c.approval.waitContext(ctx)
 	defer cancelWait()

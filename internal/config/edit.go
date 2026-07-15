@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"strings"
 
@@ -16,6 +17,8 @@ import (
 	"reasonix/internal/netclient"
 	"reasonix/internal/permission"
 )
+
+var validDesktopExternalOpenerID = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 
 // edit.go is the programmatic mutation surface a settings UI drives: change the
 // default model, add/remove a provider, set the planner, edit permission rules,
@@ -277,6 +280,22 @@ func (c *Config) SetDesktopLayoutStyle(style string) error {
 	default:
 		return fmt.Errorf("desktop layout style %q: must be classic|workbench|creation", style)
 	}
+	return nil
+}
+
+// SetDesktopExternalOpener stores the stable id selected by the desktop Open
+// control. Availability is deliberately checked by the native desktop shell,
+// because config is shared across operating systems and installations.
+func (c *Config) SetDesktopExternalOpener(id string) error {
+	id = strings.ToLower(strings.TrimSpace(id))
+	if id == "" {
+		c.Desktop.ExternalOpener = ""
+		return nil
+	}
+	if !validDesktopExternalOpenerID.MatchString(id) {
+		return fmt.Errorf("external opener %q: invalid id", id)
+	}
+	c.Desktop.ExternalOpener = id
 	return nil
 }
 

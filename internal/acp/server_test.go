@@ -73,18 +73,25 @@ type configurableFactory struct {
 	behavior   func(ctx context.Context, sink event.Sink, input string, p SessionParams) error
 	managers   []*jobs.Manager
 	withCtrl   func(ctx context.Context, sink event.Sink, input string, p SessionParams, ctrl *control.Controller) error
+	onBuild    func(index int, p SessionParams)
 }
 
 func (f *configurableFactory) NewSession(_ context.Context, p SessionParams) (*control.Controller, error) {
 	f.mu.Lock()
+	buildIndex := len(f.builds)
 	f.builds = append(f.builds, SessionParams{
 		Cwd:            p.Cwd,
 		Model:          p.Model,
 		EffortOverride: cloneStringPtr(p.EffortOverride),
+		RuntimeProfile: p.RuntimeProfile,
 		FileOverlay:    p.FileOverlay,
 		Terminal:       p.Terminal,
 	})
+	onBuild := f.onBuild
 	f.mu.Unlock()
+	if onBuild != nil {
+		onBuild(buildIndex, p)
+	}
 	behavior := f.behavior
 	if behavior == nil {
 		behavior = func(_ context.Context, sink event.Sink, input string, p SessionParams) error {
@@ -176,9 +183,17 @@ func (f *configurableFactory) SessionConfigState(_ context.Context, p SessionCon
 		{Value: "auto", Name: "Auto"},
 		{Value: "high", Name: "High"},
 	}
+	runtimeProfile := strings.TrimSpace(p.RuntimeProfile)
+	if runtimeProfile == "" || runtimeProfile == "full" {
+		runtimeProfile = "balanced"
+	}
+	if runtimeProfile != "economy" && runtimeProfile != "balanced" && runtimeProfile != "delivery" {
+		return SessionConfigState{}, os.ErrInvalid
+	}
 	return SessionConfigState{
 		Model:          model,
 		EffortOverride: effortOverride,
+		RuntimeProfile: runtimeProfile,
 		Models: &SessionModelState{
 			AvailableModels: []ModelInfo{{ModelID: "fast", Name: "Fast"}, {ModelID: "pro", Name: "Pro"}},
 			CurrentModelID:  model,
@@ -186,6 +201,9 @@ func (f *configurableFactory) SessionConfigState(_ context.Context, p SessionCon
 		ConfigOptions: []SessionConfigOption{
 			{ID: "model", Name: "Model", Category: "model", Type: "select", CurrentValue: model, Options: modelOptions},
 			{ID: "effort", Name: "Effort", Category: "thought_level", Type: "select", CurrentValue: effort, Options: effortOptions},
+			{ID: "work_mode", Name: "Work Mode", Category: "work_mode", Type: "select", CurrentValue: runtimeProfile, Options: []SessionConfigSelectOption{
+				{Value: "economy", Name: "Economy"}, {Value: "balanced", Name: "Balanced"}, {Value: "delivery", Name: "Delivery"},
+			}},
 		},
 	}, nil
 }
@@ -669,6 +687,221 @@ func TestServeSessionConfigSwitchesModelAndEffort(t *testing.T) {
 	}
 }
 
+func TestServeSessionAxesStayIndependent(t *testing.T) {
+	type observed struct {
+		profile  string
+		approval string
+		plan     bool
+		goal     string
+	}
+	seen := make(chan observed, 2)
+	factory := &configurableFactory{
+		withCtrl: func(_ context.Context, sink event.Sink, input string, p SessionParams, ctrl *control.Controller) error {
+			seen <- observed{
+				profile:  p.RuntimeProfile,
+				approval: ctrl.ToolApprovalMode(),
+				plan:     ctrl.PlanMode(),
+				goal:     ctrl.Goal(),
+			}
+			ctrl.ClearGoal()
+			sink.Emit(event.Event{Kind: event.Text, Text: "done"})
+			return nil
+		},
+	}
+	client, stop := startServer(t, factory)
+	defer stop()
+
+	client.call(t, "initialize", InitializeParams{ProtocolVersion: 1})
+	newResp := client.call(t, "session/new", SessionNewParams{Cwd: t.TempDir()})
+	var nr SessionNewResult
+	if err := json.Unmarshal(newResp.Result, &nr); err != nil {
+		t.Fatalf("session/new result: %v", err)
+	}
+	work, ok := findConfigOption(nr.ConfigOptions, "work_mode")
+	if !ok || work.CurrentValue != "balanced" {
+		t.Fatalf("initial work mode = %+v, want balanced", work)
+	}
+	approval, ok := findConfigOption(nr.ConfigOptions, "tool_approval")
+	if !ok || approval.CurrentValue != control.ToolApprovalAsk {
+		t.Fatalf("initial tool approval = %+v, want ask", approval)
+	}
+
+	setWork := client.call(t, "session/set_config_option", SetSessionConfigOptionParams{
+		SessionID: nr.SessionID,
+		ConfigID:  "work_mode",
+		Value:     "delivery",
+	})
+	if setWork.Error != nil {
+		t.Fatalf("set work mode: %+v", setWork.Error)
+	}
+	if got := factory.buildAt(t, 1).RuntimeProfile; got != "delivery" {
+		t.Fatalf("rebuilt runtime profile = %q, want delivery", got)
+	}
+	buildsAfterWorkMode := factory.buildCount()
+
+	setApproval := client.call(t, "session/set_config_option", SetSessionConfigOptionParams{
+		SessionID: nr.SessionID,
+		ConfigID:  "tool_approval",
+		Value:     control.ToolApprovalAuto,
+	})
+	if setApproval.Error != nil {
+		t.Fatalf("set tool approval: %+v", setApproval.Error)
+	}
+	if got := factory.buildCount(); got != buildsAfterWorkMode {
+		t.Fatalf("tool approval rebuilt controller: builds=%d, want %d", got, buildsAfterWorkMode)
+	}
+
+	setGoal := client.call(t, "session/set_mode", SessionSetModeParams{SessionID: nr.SessionID, ModeID: sessionModeGoal})
+	if setGoal.Error != nil {
+		t.Fatalf("set goal mode: %+v", setGoal.Error)
+	}
+	promptCh := client.callAsync("session/prompt", SessionPromptParams{
+		SessionID: nr.SessionID,
+		Prompt:    []ContentBlock{{Type: "text", Text: "ship the ACP profile switch"}},
+	})
+	_, promptResp := drainPrompt(t, client, promptCh)
+	if promptResp.Error != nil {
+		t.Fatalf("goal prompt: %+v", promptResp.Error)
+	}
+	goalObserved := <-seen
+	if goalObserved.profile != "delivery" || goalObserved.approval != control.ToolApprovalAuto || goalObserved.plan || goalObserved.goal != "ship the ACP profile switch" {
+		t.Fatalf("goal axes = %+v, want delivery + auto + goal", goalObserved)
+	}
+
+	setPlan := client.call(t, "session/set_mode", SessionSetModeParams{SessionID: nr.SessionID, ModeID: sessionModePlan})
+	if setPlan.Error != nil {
+		t.Fatalf("set plan mode: %+v", setPlan.Error)
+	}
+	promptCh = client.callAsync("session/prompt", SessionPromptParams{
+		SessionID: nr.SessionID,
+		Prompt:    []ContentBlock{{Type: "text", Text: "plan the follow-up"}},
+	})
+	_, promptResp = drainPrompt(t, client, promptCh)
+	if promptResp.Error != nil {
+		t.Fatalf("plan prompt: %+v", promptResp.Error)
+	}
+	planObserved := <-seen
+	if planObserved.profile != "delivery" || planObserved.approval != control.ToolApprovalAuto || !planObserved.plan || planObserved.goal != "" {
+		t.Fatalf("plan axes = %+v, want delivery + auto + plan", planObserved)
+	}
+}
+
+func TestServeLegacyModeAliasesRemainCompatible(t *testing.T) {
+	type observed struct {
+		approval string
+		plan     bool
+	}
+	seen := make(chan observed, 2)
+	factory := &configurableFactory{
+		withCtrl: func(_ context.Context, sink event.Sink, _ string, _ SessionParams, ctrl *control.Controller) error {
+			seen <- observed{approval: ctrl.ToolApprovalMode(), plan: ctrl.PlanMode()}
+			sink.Emit(event.Event{Kind: event.Text, Text: "done"})
+			return nil
+		},
+	}
+	client, stop := startServer(t, factory)
+	defer stop()
+	client.call(t, "initialize", InitializeParams{ProtocolVersion: 1})
+	newResp := client.call(t, "session/new", SessionNewParams{Cwd: t.TempDir()})
+	var nr SessionNewResult
+	if err := json.Unmarshal(newResp.Result, &nr); err != nil {
+		t.Fatalf("session/new result: %v", err)
+	}
+
+	for _, tc := range []struct {
+		mode string
+		want string
+	}{
+		{mode: sessionModeLegacyDefault, want: control.ToolApprovalAsk},
+		{mode: sessionModeLegacyAuto, want: control.ToolApprovalYolo},
+	} {
+		if resp := client.call(t, "session/set_mode", SessionSetModeParams{SessionID: nr.SessionID, ModeID: tc.mode}); resp.Error != nil {
+			t.Fatalf("set legacy mode %q: %+v", tc.mode, resp.Error)
+		}
+		promptCh := client.callAsync("session/prompt", SessionPromptParams{
+			SessionID: nr.SessionID,
+			Prompt:    []ContentBlock{{Type: "text", Text: "check legacy mode"}},
+		})
+		_, promptResp := drainPrompt(t, client, promptCh)
+		if promptResp.Error != nil {
+			t.Fatalf("prompt after legacy mode %q: %+v", tc.mode, promptResp.Error)
+		}
+		if got := <-seen; got.approval != tc.want || got.plan {
+			t.Fatalf("legacy mode %q = %+v, want approval %q without plan", tc.mode, got, tc.want)
+		}
+	}
+}
+
+func TestServeSessionAxesRestoreFromMetadata(t *testing.T) {
+	dir := t.TempDir()
+	sessionID := "axes-restore"
+	path := transcriptPath(dir, sessionID)
+	saved := agent.NewSession("")
+	saved.Add(provider.Message{Role: provider.RoleUser, Content: "persist these axes"})
+	if err := saved.Save(path); err != nil {
+		t.Fatalf("save transcript: %v", err)
+	}
+	if err := saveACPMeta(path, acpSessionMeta{
+		SessionID:         sessionID,
+		Cwd:               dir,
+		Model:             "fast",
+		RuntimeProfile:    "delivery",
+		ToolApprovalMode:  control.ToolApprovalAuto,
+		CollaborationMode: sessionModePlan,
+		CreatedAt:         time.Now().UTC(),
+		UpdatedAt:         time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("save ACP metadata: %v", err)
+	}
+
+	seen := make(chan struct {
+		approval string
+		plan     bool
+	}, 1)
+	reloadedFactory := &configurableFactory{
+		dir: dir,
+		withCtrl: func(_ context.Context, sink event.Sink, _ string, _ SessionParams, ctrl *control.Controller) error {
+			seen <- struct {
+				approval string
+				plan     bool
+			}{approval: ctrl.ToolApprovalMode(), plan: ctrl.PlanMode()}
+			sink.Emit(event.Event{Kind: event.Text, Text: "done"})
+			return nil
+		},
+	}
+	reloadedClient, stopReloaded := startServer(t, reloadedFactory)
+	defer stopReloaded()
+	reloadedClient.call(t, "initialize", InitializeParams{ProtocolVersion: 1})
+	loadResp := reloadedClient.call(t, "session/load", SessionLoadParams{SessionID: sessionID, Cwd: dir})
+	if loadResp.Error != nil {
+		t.Fatalf("session/load: %+v", loadResp.Error)
+	}
+	var lr SessionLoadResult
+	if err := json.Unmarshal(loadResp.Result, &lr); err != nil {
+		t.Fatalf("session/load result: %v", err)
+	}
+	work, _ := findConfigOption(lr.ConfigOptions, "work_mode")
+	approval, _ := findConfigOption(lr.ConfigOptions, "tool_approval")
+	if work.CurrentValue != "delivery" || approval.CurrentValue != control.ToolApprovalAuto || lr.Modes == nil || lr.Modes.CurrentModeID != sessionModePlan {
+		t.Fatalf("reloaded axes = work:%+v approval:%+v modes:%+v", work, approval, lr.Modes)
+	}
+	if got := reloadedFactory.buildAt(t, 0).RuntimeProfile; got != "delivery" {
+		t.Fatalf("reloaded build profile = %q, want delivery", got)
+	}
+	promptCh := reloadedClient.callAsync("session/prompt", SessionPromptParams{
+		SessionID: sessionID,
+		Prompt:    []ContentBlock{{Type: "text", Text: "verify restored controller"}},
+	})
+	_, promptResp := drainPrompt(t, reloadedClient, promptCh)
+	if promptResp.Error != nil {
+		t.Fatalf("reloaded prompt: %+v", promptResp.Error)
+	}
+	observed := <-seen
+	if observed.approval != control.ToolApprovalAuto || !observed.plan {
+		t.Fatalf("restored controller axes = %+v, want auto + plan", observed)
+	}
+}
+
 func TestServeSessionConfigQueuesDuringActivePrompt(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -834,6 +1067,86 @@ func TestServeSessionConfigRejectsBackgroundJobsWhileIdle(t *testing.T) {
 	}
 	if !usedNewModel {
 		t.Fatalf("prompt after retry did not use new model; notifications=%+v", notifs)
+	}
+}
+
+func TestQueuedRebuildPreservesControllerSideAxisDrift(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	seen := make(chan struct {
+		profile  string
+		approval string
+		plan     bool
+	}, 1)
+	var first sync.Once
+	factory := &configurableFactory{
+		withCtrl: func(ctx context.Context, sink event.Sink, _ string, p SessionParams, ctrl *control.Controller) error {
+			isFirst := false
+			first.Do(func() { isFirst = true })
+			if isFirst {
+				close(started)
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				// Simulate slash-command/controller-side state changes late in the
+				// turn, after the client has queued a work-mode rebuild.
+				ctrl.SetPlanMode(false)
+				ctrl.SetToolApprovalMode(control.ToolApprovalAuto)
+			} else {
+				seen <- struct {
+					profile  string
+					approval string
+					plan     bool
+				}{p.RuntimeProfile, ctrl.ToolApprovalMode(), ctrl.PlanMode()}
+			}
+			sink.Emit(event.Event{Kind: event.Text, Text: "done"})
+			return nil
+		},
+	}
+	client, stop := startServer(t, factory)
+	defer stop()
+	client.call(t, "initialize", InitializeParams{ProtocolVersion: 1})
+	newResp := client.call(t, "session/new", SessionNewParams{Cwd: t.TempDir()})
+	var nr SessionNewResult
+	if err := json.Unmarshal(newResp.Result, &nr); err != nil {
+		t.Fatalf("session/new result: %v", err)
+	}
+	if resp := client.call(t, "session/set_mode", SessionSetModeParams{SessionID: nr.SessionID, ModeID: sessionModePlan}); resp.Error != nil {
+		t.Fatalf("set plan mode: %+v", resp.Error)
+	}
+	firstPrompt := client.callAsync("session/prompt", SessionPromptParams{
+		SessionID: nr.SessionID,
+		Prompt:    []ContentBlock{{Type: "text", Text: "first"}},
+	})
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first prompt did not start")
+	}
+	if resp := client.call(t, "session/set_config_option", SetSessionConfigOptionParams{
+		SessionID: nr.SessionID,
+		ConfigID:  "work_mode",
+		Value:     "delivery",
+	}); resp.Error != nil {
+		t.Fatalf("queue work mode: %+v", resp.Error)
+	}
+	close(release)
+	if _, resp := drainPrompt(t, client, firstPrompt); resp.Error != nil {
+		t.Fatalf("first prompt: %+v", resp.Error)
+	}
+
+	secondPrompt := client.callAsync("session/prompt", SessionPromptParams{
+		SessionID: nr.SessionID,
+		Prompt:    []ContentBlock{{Type: "text", Text: "second"}},
+	})
+	if _, resp := drainPrompt(t, client, secondPrompt); resp.Error != nil {
+		t.Fatalf("second prompt: %+v", resp.Error)
+	}
+	got := <-seen
+	if got.profile != "delivery" || got.approval != control.ToolApprovalAuto || got.plan {
+		t.Fatalf("rebuilt axes = %+v, want delivery + auto + normal", got)
 	}
 }
 
@@ -1090,6 +1403,17 @@ func TestServeSessionLoadFallsBackFromStaleSavedModel(t *testing.T) {
 	}
 	if got := factory.buildAt(t, 0).Model; got != "fast" {
 		t.Fatalf("fallback build model = %q, want fast", got)
+	}
+	if got := factory.buildAt(t, 0).RuntimeProfile; got != "balanced" {
+		t.Fatalf("old metadata runtime profile = %q, want balanced", got)
+	}
+	var loaded SessionLoadResult
+	if err := json.Unmarshal(loadResp.Result, &loaded); err != nil {
+		t.Fatalf("session/load result: %v", err)
+	}
+	approval, _ := findConfigOption(loaded.ConfigOptions, "tool_approval")
+	if approval.CurrentValue != control.ToolApprovalAsk || loaded.Modes == nil || loaded.Modes.CurrentModeID != sessionModeNormal {
+		t.Fatalf("old metadata axes = approval:%+v modes:%+v, want ask + normal", approval, loaded.Modes)
 	}
 	meta, ok, err := loadACPMeta(path)
 	if err != nil || !ok {

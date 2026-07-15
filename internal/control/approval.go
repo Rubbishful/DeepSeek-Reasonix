@@ -231,6 +231,41 @@ func (a *approvalManager) grantPlanModeReadOnlyCommand(prefix string) {
 	a.planModeReadOnlyCommands[prefix] = true
 }
 
+// SessionAuthorizations is the same-session tool-grant and Plan-mode
+// read-only command trust state a controller rebuild must carry forward; see
+// Controller.SessionAuthorizations / RestoreSessionAuthorizations.
+type SessionAuthorizations struct {
+	Grants                   []string
+	PlanModeReadOnlyCommands []string
+}
+
+func (a *approvalManager) snapshotSessionAuthorizations() SessionAuthorizations {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	auth := SessionAuthorizations{
+		Grants:                   make([]string, 0, len(a.granted)),
+		PlanModeReadOnlyCommands: make([]string, 0, len(a.planModeReadOnlyCommands)),
+	}
+	for rule := range a.granted {
+		auth.Grants = append(auth.Grants, rule)
+	}
+	for prefix := range a.planModeReadOnlyCommands {
+		auth.PlanModeReadOnlyCommands = append(auth.PlanModeReadOnlyCommands, prefix)
+	}
+	return auth
+}
+
+func (a *approvalManager) restoreSessionAuthorizations(auth SessionAuthorizations) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, rule := range auth.Grants {
+		a.granted[rule] = true
+	}
+	for _, prefix := range auth.PlanModeReadOnlyCommands {
+		a.planModeReadOnlyCommands[prefix] = true
+	}
+}
+
 // cancel drops a pending approval (timeout/abort path).
 func (a *approvalManager) cancel(id string) {
 	a.mu.Lock()
@@ -299,9 +334,9 @@ func (a *approvalManager) mode() string {
 }
 
 // setMode applies a (pre-normalized) posture and drains any pending approvals
-// the new posture should auto-allow, returning their reply channels for the
-// caller to signal after unlocking.
-func (a *approvalManager) setMode(mode string) []chan approvalReply {
+// the new posture should auto-allow, returning them for the caller to signal
+// {allow:true} after unlocking.
+func (a *approvalManager) setMode(mode string) []drainedApproval {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.toolApprovalMode = mode
@@ -379,11 +414,18 @@ func (a *approvalManager) sessionGrantAllowsLocked(tool, subject string) bool {
 	return false
 }
 
+// drainedApproval is a pending approval removed by a posture switch, keeping
+// its prompt id so frontends can dismiss exactly the prompts the new posture
+// resolved (fresh/plan/memory prompts stay pending and must stay visible).
+type drainedApproval struct {
+	id    string
+	reply chan approvalReply
+}
+
 // drainLocked removes every pending approval the new posture should auto-allow
-// and returns their reply channels; caller holds a.mu and sends {allow:true}
-// after unlocking.
-func (a *approvalManager) drainLocked(includeExplicitAsk bool) []chan approvalReply {
-	pending := make([]chan approvalReply, 0, len(a.approvals))
+// and returns them; caller holds a.mu and sends {allow:true} after unlocking.
+func (a *approvalManager) drainLocked(includeExplicitAsk bool) []drainedApproval {
+	pending := make([]drainedApproval, 0, len(a.approvals))
 	for id, approval := range a.approvals {
 		if approval.fresh || requiresFreshApprovalTool(approval.tool) {
 			continue
@@ -392,7 +434,7 @@ func (a *approvalManager) drainLocked(includeExplicitAsk bool) []chan approvalRe
 			continue
 		}
 		delete(a.approvals, id)
-		pending = append(pending, approval.reply)
+		pending = append(pending, drainedApproval{id: id, reply: approval.reply})
 	}
 	return pending
 }

@@ -1387,7 +1387,7 @@ func TestEffortCommandWritesCurrentDeepSeekProvider(t *testing.T) {
 	m := newTestChatTUI()
 	m.ctrl = control.New(control.Options{Label: "deepseek-flash"})
 	m.modelRef = "deepseek-flash/deepseek-v4-flash"
-	m.buildController = func(_ controllerBuildSpec, _ []provider.Message, _ string) (*control.Controller, error) {
+	m.buildController = func(_ controllerBuildSpec, _ []provider.Message, _ string, _ control.SessionAPI) (*control.Controller, error) {
 		return control.New(control.Options{Label: "deepseek-flash"}), nil
 	}
 
@@ -1412,7 +1412,7 @@ func TestEffortCommandRejectsUnsupportedProvider(t *testing.T) {
 	m := newTestChatTUI()
 	m.ctrl = control.New(control.Options{Label: "mimo-pro"})
 	m.modelRef = "mimo-pro/mimo-v2.5-pro"
-	m.buildController = func(_ controllerBuildSpec, _ []provider.Message, _ string) (*control.Controller, error) {
+	m.buildController = func(_ controllerBuildSpec, _ []provider.Message, _ string, _ control.SessionAPI) (*control.Controller, error) {
 		return control.New(control.Options{Label: "mimo-pro"}), nil
 	}
 
@@ -1430,7 +1430,7 @@ func TestEffortCommandAutoClearsProviderEffort(t *testing.T) {
 	m := newTestChatTUI()
 	m.ctrl = control.New(control.Options{Label: "deepseek-flash"})
 	m.modelRef = "deepseek-flash/deepseek-v4-flash"
-	m.buildController = func(_ controllerBuildSpec, _ []provider.Message, _ string) (*control.Controller, error) {
+	m.buildController = func(_ controllerBuildSpec, _ []provider.Message, _ string, _ control.SessionAPI) (*control.Controller, error) {
 		return control.New(control.Options{Label: "deepseek-flash"}), nil
 	}
 
@@ -2183,6 +2183,36 @@ func TestWideInputChangeRequestsClearScreen(t *testing.T) {
 	}
 	if !shouldClearWideInputChange("a门", "a") {
 		t.Fatal("removing a wide character from mixed input should request a full redraw")
+	}
+}
+
+func TestChooserFreeTextWideInputChangeRequestsClearScreen(t *testing.T) {
+	prev := clearWideInputChanges
+	clearWideInputChanges = true
+	defer func() { clearWideInputChanges = prev }()
+
+	m := newTestChatTUI()
+	m.chooser = newChooser(event.Ask{
+		ID: "ask-1",
+		Questions: []event.AskQuestion{{
+			ID:     "q1",
+			Prompt: "Pick one",
+			Options: []event.AskOption{{
+				Label: "Option A",
+			}},
+		}},
+	})
+	m.chooser.typing = true
+	m.input.SetValue("天安a")
+	m.input.SetCursorColumn(len([]rune("天安a")))
+
+	next, cmd := m.update(tea.KeyPressMsg{Code: '门', Text: "门"})
+	got := next.(chatTUI)
+	if got.input.Value() != "天安a门" {
+		t.Fatalf("chooser free-text input should preserve the textarea value, got %q", got.input.Value())
+	}
+	if cmd == nil {
+		t.Fatal("chooser free-text wide-char input changes should request a full redraw")
 	}
 }
 

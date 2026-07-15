@@ -6,6 +6,7 @@ export type ShortcutPlatform = "darwin" | "windows" | "linux";
 export type ShortcutAction =
   | "app.newSession"
   | "commandPalette.open"
+  | "selection.addToChat"
   | "settings.open"
   | "tab.close"
   | "shell.toggle"
@@ -86,6 +87,17 @@ export const SHORTCUT_DEFINITIONS: readonly ShortcutDefinition[] = [
     descriptionKey: "shortcuts.desc.closeTab",
     defaults: modCombo("w"),
     preventDefault: true,
+  },
+  {
+    action: "selection.addToChat",
+    section: "session",
+    labelKey: "shortcuts.action.addSelectionToChat",
+    descriptionKey: "shortcuts.desc.addSelectionToChat",
+    defaults: modCombo("l"),
+    preventDefault: true,
+    // The handler only arms while the transcript selection action is visible,
+    // so firing from an editable target (composer focus) is safe and expected.
+    allowInEditable: true,
   },
   {
     action: "shell.toggle",

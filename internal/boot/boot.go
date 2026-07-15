@@ -344,20 +344,21 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	// only; bodies load on demand via run_skill or "/<name>". Bodies never enter
 	// the prefix, so the index costs a fixed, small amount per turn.
 	skillStore := skill.New(skill.Options{
-		ProjectRoot:   root,
-		CustomPaths:   cfg.SkillCustomPaths(),
-		PluginPaths:   cfg.PluginPackageSkillOwners(),
-		ExcludedPaths: cfg.SkillExcludedPaths(),
-		DisabledNames: cfg.DisabledSkillNames(),
-		MaxDepth:      cfg.SkillMaxDepth(),
-		Stderr:        opts.Stderr,
+		ProjectRoot:      root,
+		CustomPaths:      cfg.SkillCustomPaths(),
+		PluginPaths:      cfg.PluginPackageSkillOwners(),
+		PluginAgentPaths: cfg.PluginPackageAgentOwners(),
+		ExcludedPaths:    cfg.SkillExcludedPaths(),
+		DisabledNames:    cfg.DisabledSkillNames(),
+		MaxDepth:         cfg.SkillMaxDepth(),
+		Stderr:           opts.Stderr,
 	})
 	// Install the static profile filter before building the prompt index and
 	// dedicated skill tools. The dependency checker is attached once the live
 	// registry/plugin host has been assembled below.
 	skillStore.ConfigureInvocationPolicy(string(runtimeProfile), nil)
 	skills := skillStore.List()
-	allSkillStore := skill.New(skill.Options{ProjectRoot: root, CustomPaths: cfg.SkillCustomPaths(), PluginPaths: cfg.PluginPackageSkillOwners(), ExcludedPaths: cfg.SkillExcludedPaths(), MaxDepth: cfg.SkillMaxDepth(), Stderr: io.Discard})
+	allSkillStore := skill.New(skill.Options{ProjectRoot: root, CustomPaths: cfg.SkillCustomPaths(), PluginPaths: cfg.PluginPackageSkillOwners(), PluginAgentPaths: cfg.PluginPackageAgentOwners(), ExcludedPaths: cfg.SkillExcludedPaths(), MaxDepth: cfg.SkillMaxDepth(), Stderr: io.Discard})
 	allSkills := allSkillStore.List()
 	if !tokenEconomy {
 		sysPrompt = skill.ApplyIndex(sysPrompt, skills)
@@ -392,7 +393,12 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		enabledBuiltins = tokenEconomyBuiltins(enabledBuiltins)
 	}
 	readPathResolver := builtin.NewPathResolver()
-	addBuiltins(reg, enabledBuiltins, writeRoots, bashSpec, bashTimeout, searchSpec, stderr, root, proxySpec, forbidReadRoots, readPathResolver, sessionGuard, managedConfig, opts.FileOverlay, opts.TerminalRunner)
+	// An explicit Economy allowlist can contain only on-demand tools, leaving no
+	// startup built-ins. Do not pass that filtered empty slice to addBuiltins,
+	// where an empty list intentionally means "all built-ins".
+	if !tokenEconomy || len(cfg.Tools.Enabled) == 0 || len(enabledBuiltins) > 0 {
+		addBuiltins(reg, enabledBuiltins, writeRoots, bashSpec, bashTimeout, searchSpec, stderr, root, proxySpec, forbidReadRoots, readPathResolver, sessionGuard, managedConfig, opts.FileOverlay, opts.TerminalRunner)
+	}
 	// Use the caller-supplied shared host when set, so controllers for the same
 	// workspace root reuse running MCP processes (e.g. one CodeGraph daemon
 	// instead of one per tab). Otherwise construct a private host per controller.
@@ -713,20 +719,35 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		addReadOnlyTaskTool()
 	}
 
-	// The `memory` tool searches/reads saved facts on demand; `remember` persists
-	// durable facts to the project's auto-memory store; `forget` prunes ones that
-	// turn out wrong. The saved index loads into the prefix on the next session.
-	reg.Add(history.NewTool(history.Options{SessionDir: sessionDir, GlobalSessionDir: config.SessionDir(), ArchiveDir: config.ArchiveDir()}))
-
-	// Session history tools let the AI discover and read past conversations.
-	// `list_sessions` returns all saved session files; `read_session` loads one
-	// and renders the full conversation as readable text.
-	reg.Add(sessiontool.NewListSessionsTool(sessionDir))
-	reg.Add(sessiontool.NewReadSessionTool(sessionDir))
-
-	reg.Add(memory.NewRecallTool(mem.Store))
-	reg.Add(memory.NewRememberTool(mem.Store))
-	reg.Add(memory.NewForgetTool(mem.Store))
+	// Session and memory tools are always present in Balanced/Delivery. Economy
+	// installs them only after connect_tool_source requests that capability, so
+	// simple coding turns do not pay for unrelated schemas.
+	sessionToolsAdded := false
+	addSessionTools := func() string {
+		if sessionToolsAdded {
+			return "sessions are already enabled."
+		}
+		sessionToolsAdded = true
+		reg.Add(history.NewTool(history.Options{SessionDir: sessionDir, GlobalSessionDir: config.SessionDir(), ArchiveDir: config.ArchiveDir()}))
+		reg.Add(sessiontool.NewListSessionsTool(sessionDir))
+		reg.Add(sessiontool.NewReadSessionTool(sessionDir))
+		return "enabled history, list_sessions, read_session."
+	}
+	memoryToolsAdded := false
+	addMemoryTools := func() string {
+		if memoryToolsAdded {
+			return "memory tools are already enabled."
+		}
+		memoryToolsAdded = true
+		reg.Add(memory.NewRecallTool(mem.Store))
+		reg.Add(memory.NewRememberTool(mem.Store))
+		reg.Add(memory.NewForgetTool(mem.Store))
+		return "enabled memory, remember, forget."
+	}
+	if !tokenEconomy {
+		addSessionTools()
+		addMemoryTools()
+	}
 
 	// The `ask` tool puts structured multiple-choice questions to the user. It
 	// reaches them through the Asker on the call context, which interactive
@@ -926,7 +947,12 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	// Custom slash commands (.reasonix/commands + user dir). Best-effort: a malformed
 	// file is skipped, and a load error never blocks the session.
 	cmds, _ := command.LoadRoots(config.CommandRootsForRoot(root)...)
-	addSlashCommandTool := func(includeSkills bool) {
+	slashCommandAdded := false
+	slashCommandIncludesSkills := false
+	addSlashCommandTool := func(includeSkills bool) string {
+		if slashCommandAdded && (!includeSkills || slashCommandIncludesSkills) {
+			return "slash commands are already enabled."
+		}
 		// Expose loaded slash commands to the model via slash_command. In economy
 		// mode skills join this list only after the skills source is enabled.
 		var slashEntries []command.SlashEntry
@@ -953,6 +979,9 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			})
 		}
 		reg.Add(command.NewSlashCommandTool(slashEntries))
+		slashCommandAdded = true
+		slashCommandIncludesSkills = slashCommandIncludesSkills || includeSkills
+		return "enabled slash_command."
 	}
 	installSourceAdded := false
 	addInstallSourceTool := func() string {
@@ -1023,13 +1052,40 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		addSlashCommandTool(true)
 		return "enabled skills. Use run_skill/read_skill/read_only_skill or the dedicated skill tools on the next model request.\n\n" + skill.IndexBlock(skills)
 	}
-	if tokenEconomy {
-		addSlashCommandTool(false)
-	} else {
+	if !tokenEconomy {
 		addInstallSourceTool()
 		addSkillTools()
 	}
 	if tokenEconomy {
+		addBuiltinSourceTools := func(source string, names ...string) string {
+			var missing []string
+			for _, name := range names {
+				if !builtinToolEnabled(cfg.Tools.Enabled, name) {
+					continue
+				}
+				if _, exists := reg.Get(name); !exists {
+					missing = append(missing, name)
+				}
+			}
+			if len(missing) == 0 {
+				return source + " tools are already enabled or disabled by [tools].enabled."
+			}
+			installed := addTools(reg, builtin.Workspace{
+				Dir:             root,
+				WriteRoots:      writeRoots,
+				ForbidReadRoots: forbidReadRoots,
+				Bash:            bashSpec,
+				BashTimeout:     bashTimeout,
+				Search:          searchSpec,
+				ProxySpec:       proxySpec,
+				ReadPaths:       readPathResolver,
+				SessionGuard:    sessionGuard,
+				ManagedConfig:   managedConfig,
+				FileOverlay:     opts.FileOverlay,
+				Terminal:        opts.TerminalRunner,
+			}.Tools(missing...))
+			return "enabled " + strings.Join(installed, ", ") + "."
+		}
 		reg.Add(&toolSourceConnector{
 			skills: func(context.Context) (string, error) {
 				return addSkillTools(), nil
@@ -1072,6 +1128,31 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 					return "LSP tools are already enabled.", nil
 				}
 				return "enabled " + strings.Join(names, ", ") + ".", nil
+			},
+			sessions: func(context.Context) (string, error) {
+				return addSessionTools(), nil
+			},
+			memory: func(context.Context) (string, error) {
+				return addMemoryTools(), nil
+			},
+			commands: func(context.Context) (string, error) {
+				return addSlashCommandTool(false), nil
+			},
+			search: func(context.Context) (string, error) {
+				return addBuiltinSourceTools("search", "code_index", "glob", "grep", "ls"), nil
+			},
+			files: func(context.Context) (string, error) {
+				return addBuiltinSourceTools("files", "delete_range", "delete_symbol", "move_file", "multi_edit", "notebook_edit"), nil
+			},
+			workflow: func(ctx context.Context) (string, error) {
+				// Plan mode narrows workflow to its read-only planning subset:
+				// todo_write stays available (planmode.Marker promises it),
+				// while complete_step joins via a fresh connect after approval.
+				if agent.PlanModeFromContext(ctx) {
+					return addBuiltinSourceTools("workflow", "todo_write") +
+						" complete_step stays blocked in plan mode; connect workflow again after plan approval to enable it.", nil
+				}
+				return addBuiltinSourceTools("workflow", "complete_step", "todo_write"), nil
 			},
 			mcp: func(_ context.Context, name string) (string, error) {
 				spec, ok := onDemandMCPSpecs[name]

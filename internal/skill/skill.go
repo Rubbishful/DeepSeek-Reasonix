@@ -67,6 +67,10 @@ type Skill struct {
 	Scope       Scope  // where it came from
 	Path        string // absolute path to the SKILL.md / <name>.md, or "(builtin)"
 	Plugin      string // installed plugin package name; empty for non-plugin skills
+	// SlashPrefix overrides Plugin only for the user-facing invocation name.
+	// Imported Claude agents use <plugin>:agent so an agent and skill may safely
+	// share the same upstream name.
+	SlashPrefix string
 	// AllowedTools, when non-empty, scopes a subagent skill's tool registry to
 	// these literal tool names (from the `allowed-tools` frontmatter).
 	AllowedTools []string
@@ -106,10 +110,14 @@ type Skill struct {
 // SlashName returns the user-facing slash identifier. Plugin skills use a
 // package-qualified name while the internal Name remains stable for run_skill.
 func (s Skill) SlashName() string {
-	if strings.TrimSpace(s.Plugin) == "" {
+	prefix := strings.TrimSpace(s.SlashPrefix)
+	if prefix == "" {
+		prefix = strings.TrimSpace(s.Plugin)
+	}
+	if prefix == "" {
 		return s.Name
 	}
-	return strings.TrimSpace(s.Plugin) + ":" + s.Name
+	return prefix + ":" + s.Name
 }
 
 // IsValidName reports whether name is a usable skill identifier.
@@ -120,15 +128,16 @@ func IsValidName(name string) bool { return config.IsValidSkillName(name) }
 // ReasonixHomeDir overrides the canonical Reasonix home; empty uses
 // config.ReasonixHomeDir(), or HomeDir/.reasonix when HomeDir is explicitly set.
 type Options struct {
-	HomeDir         string
-	ReasonixHomeDir string
-	ProjectRoot     string
-	CustomPaths     []string
-	PluginPaths     map[string][]string // canonical custom root -> installed plugin package names
-	ExcludedPaths   []string
-	DisabledNames   []string
-	MaxDepth        int
-	DisableBuiltins bool // suppress shipped built-ins (test-only knob)
+	HomeDir          string
+	ReasonixHomeDir  string
+	ProjectRoot      string
+	CustomPaths      []string
+	PluginPaths      map[string][]string // canonical custom root -> installed plugin package names
+	PluginAgentPaths map[string][]string // plugin roots whose flat Markdown files are Claude agents
+	ExcludedPaths    []string
+	DisabledNames    []string
+	MaxDepth         int
+	DisableBuiltins  bool // suppress shipped built-ins (test-only knob)
 	// Stderr is the writer for diagnostic warnings. When nil, defaults to
 	// os.Stderr. Set to io.Discard to suppress output (e.g. during model
 	// switch inside a bubbletea session).
@@ -137,18 +146,19 @@ type Options struct {
 
 // Store resolves skills across the configured roots.
 type Store struct {
-	homeDir         string
-	reasonixHomeDir string
-	projectRoot     string
-	customPaths     []string
-	pluginPaths     map[string][]string
-	excludedPaths   map[string]bool
-	disabled        map[string]bool
-	maxDepth        int
-	disableBuiltins bool
-	stderr          io.Writer
-	runtimeProfile  string
-	requiresReady   func([]string) []string
+	homeDir          string
+	reasonixHomeDir  string
+	projectRoot      string
+	customPaths      []string
+	pluginPaths      map[string][]string
+	pluginAgentPaths map[string][]string
+	excludedPaths    map[string]bool
+	disabled         map[string]bool
+	maxDepth         int
+	disableBuiltins  bool
+	stderr           io.Writer
+	runtimeProfile   string
+	requiresReady    func([]string) []string
 }
 
 // New builds a Store. Relative custom paths and a relative project root are made
@@ -182,6 +192,7 @@ func New(opts Options) *Store {
 	}
 	custom := dedupePaths(resolveCustomPaths(opts.CustomPaths, base, home))
 	pluginPaths := normalizePluginPaths(opts.PluginPaths)
+	pluginAgentPaths := normalizePluginPaths(opts.PluginAgentPaths)
 	excluded := map[string]bool{}
 	for _, p := range dedupePaths(resolveCustomPaths(opts.ExcludedPaths, base, home)) {
 		excluded[config.CanonicalSkillPath(p)] = true
@@ -191,16 +202,17 @@ func New(opts Options) *Store {
 		stderr = os.Stderr
 	}
 	return &Store{
-		homeDir:         home,
-		reasonixHomeDir: reasonixHome,
-		projectRoot:     root,
-		customPaths:     custom,
-		pluginPaths:     pluginPaths,
-		excludedPaths:   excluded,
-		disabled:        disabledNameSet(opts.DisabledNames),
-		maxDepth:        normalizeMaxDepth(opts.MaxDepth),
-		disableBuiltins: opts.DisableBuiltins,
-		stderr:          stderr,
+		homeDir:          home,
+		reasonixHomeDir:  reasonixHome,
+		projectRoot:      root,
+		customPaths:      custom,
+		pluginPaths:      pluginPaths,
+		pluginAgentPaths: pluginAgentPaths,
+		excludedPaths:    excluded,
+		disabled:         disabledNameSet(opts.DisabledNames),
+		maxDepth:         normalizeMaxDepth(opts.MaxDepth),
+		disableBuiltins:  opts.DisableBuiltins,
+		stderr:           stderr,
 	}
 }
 
@@ -301,6 +313,7 @@ type discoveryRoot struct {
 	Root
 	requireFlatMarker bool
 	plugins           []string
+	forceSubagent     bool
 }
 
 // roots returns the discovery directories, highest priority first: the
@@ -339,10 +352,12 @@ func (s *Store) roots() []discoveryRoot {
 		if s.excludedPaths[config.CanonicalSkillPath(d.dir)] {
 			continue
 		}
+		key := config.CanonicalSkillPath(d.dir)
 		out = append(out, discoveryRoot{
 			Root:              Root{Dir: d.dir, Scope: d.scope, Priority: len(out), Status: pathStatus(d.dir)},
 			requireFlatMarker: d.requireFlatMarker,
-			plugins:           append([]string(nil), s.pluginPaths[config.CanonicalSkillPath(d.dir)]...),
+			plugins:           append([]string(nil), s.pluginPaths[key]...),
+			forceSubagent:     len(s.pluginAgentPaths[key]) > 0,
 		})
 	}
 	return out
@@ -455,6 +470,9 @@ func (s *Store) discoveredSkills() []Skill {
 			for _, plugin := range r.plugins {
 				owned := sk
 				owned.Plugin = plugin
+				if r.forceSubagent {
+					owned.SlashPrefix = plugin + ":agent"
+				}
 				out = append(out, owned)
 			}
 		}
@@ -581,6 +599,16 @@ func (s *Store) ReadSlash(name string) (Skill, bool) {
 func (s *Store) discoverRoot(r discoveryRoot) []Skill {
 	var out []Skill
 	s.scanDir(r.Dir, r.Scope, r.requireFlatMarker, 1, map[string]bool{}, &out)
+	if r.forceSubagent {
+		for i := range out {
+			out[i].RunAs = RunSubagent
+			out[i].Invocation = "manual"
+			out[i].AllowedTools = mapClaudeAgentTools(out[i].AllowedTools)
+			if isClaudeModelAlias(out[i].Model) {
+				out[i].Model = ""
+			}
+		}
+	}
 	return out
 }
 
@@ -722,7 +750,7 @@ func (s *Store) parseSkill(path, stem string, scope Scope, requireSkillMarker bo
 		Body:         loadBodyWithScripts(path, loadBodyWithReferences(path, strings.TrimSpace(body))),
 		Scope:        scope,
 		Path:         path,
-		AllowedTools: parseAllowedTools(fm[skillFrontmatterAllowedTools]),
+		AllowedTools: parseAllowedTools(firstNonEmptySkillValue(fm[skillFrontmatterAllowedTools], fm["tools"])),
 		RunAs:        parseRunAs(fm[skillFrontmatterRunAs], fm[skillFrontmatterContext], fm[skillFrontmatterAgent]),
 		Model:        strings.TrimSpace(fm[skillFrontmatterModel]),
 		Effort:       strings.TrimSpace(fm[skillFrontmatterEffort]),
@@ -740,6 +768,45 @@ func (s *Store) parseSkill(path, stem string, scope Scope, requireSkillMarker bo
 	}
 	sk.Profiles, sk.InvalidProfiles = parseProfilesFrontmatter(fm[skillFrontmatterProfiles])
 	return sk, true
+}
+
+func firstNonEmptySkillValue(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func isClaudeModelAlias(model string) bool {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "sonnet", "opus", "haiku", "inherit":
+		return true
+	default:
+		return false
+	}
+}
+
+func mapClaudeAgentTools(in []string) []string {
+	mapping := map[string]string{
+		"read": "read_file", "write": "write_file", "edit": "edit_file",
+		"bash": "bash", "grep": "grep", "glob": "glob", "ls": "ls",
+		"webfetch": "web_fetch", "websearch": "web_search",
+	}
+	out := make([]string, 0, len(in))
+	seen := map[string]bool{}
+	for _, name := range in {
+		mapped := strings.TrimSpace(name)
+		if replacement := mapping[strings.ToLower(mapped)]; replacement != "" {
+			mapped = replacement
+		}
+		if mapped != "" && !seen[mapped] {
+			seen[mapped] = true
+			out = append(out, mapped)
+		}
+	}
+	return out
 }
 
 const (
@@ -1082,12 +1149,16 @@ func parseAllowedTools(raw string) []string {
 // parseCSVFrontmatter splits simple comma-separated frontmatter values. Full
 // YAML lists are intentionally out of scope for the existing frontmatter parser.
 func parseCSVFrontmatter(raw string) []string {
-	if strings.TrimSpace(raw) == "" {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
 		return nil
+	}
+	if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+		raw = strings.TrimSpace(raw[1 : len(raw)-1])
 	}
 	var out []string
 	for _, p := range strings.Split(raw, ",") {
-		if t := strings.TrimSpace(p); t != "" {
+		if t := strings.Trim(strings.TrimSpace(p), `"'`); t != "" {
 			out = append(out, t)
 		}
 	}

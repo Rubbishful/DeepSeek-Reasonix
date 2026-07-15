@@ -2,10 +2,13 @@ package main
 
 import (
 	"log/slog"
+	"os"
 	"strings"
 
 	"reasonix/internal/agent"
+	"reasonix/internal/control"
 	"reasonix/internal/provider"
+	"reasonix/internal/store"
 )
 
 func systemPromptFrom(messages []provider.Message) string {
@@ -89,5 +92,30 @@ func resumeWithFreshSystemPrompt(ctrl interface {
 	}
 	if path != "" {
 		ctrl.SetSessionPath(path)
+	}
+}
+
+// resumeWithFreshSystemPromptAndGoal resumes an existing session without
+// seeding Goal state before Resume. A goal-state sidecar is authoritative;
+// only legacy sessions that predate the sidecar fall back to the tab profile.
+func resumeWithFreshSystemPromptAndGoal(ctrl control.SessionAPI, messages []provider.Message, path, legacyGoal string) {
+	if ctrl == nil {
+		return
+	}
+	_, sidecarErr := os.Stat(store.SessionGoalState(path))
+	resumeWithFreshSystemPrompt(ctrl, messages, path)
+	if os.IsNotExist(sidecarErr) {
+		ctrl.SetGoal(strings.TrimSpace(legacyGoal))
+	}
+}
+
+func resumeLoadedSessionAndGoal(ctrl control.SessionAPI, session *agent.Session, path, legacyGoal string) {
+	if ctrl == nil || session == nil {
+		return
+	}
+	_, sidecarErr := os.Stat(store.SessionGoalState(path))
+	ctrl.Resume(sessionWithFreshSystemPrompt(session, systemPromptFrom(ctrl.History())), path)
+	if os.IsNotExist(sidecarErr) {
+		ctrl.SetGoal(strings.TrimSpace(legacyGoal))
 	}
 }

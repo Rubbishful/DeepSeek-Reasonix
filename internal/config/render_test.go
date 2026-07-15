@@ -1023,6 +1023,27 @@ func TestRenderStringMapQuotesNonBareTOMLKeys(t *testing.T) {
 	}
 }
 
+func TestDesktopExternalOpenerUserScopeRoundTrip(t *testing.T) {
+	cfg := Default()
+	if err := cfg.SetDesktopExternalOpener("ghostty"); err != nil {
+		t.Fatal(err)
+	}
+	rendered := RenderTOMLForScope(cfg, RenderScopeUser)
+	if !strings.Contains(rendered, `external_opener = "ghostty"`) {
+		t.Fatalf("user config omitted desktop external opener:\n%s", rendered)
+	}
+	if project := RenderTOMLForScope(cfg, RenderScopeProject); strings.Contains(project, "external_opener") {
+		t.Fatalf("project config leaked user-only external opener:\n%s", project)
+	}
+	var decoded Config
+	if _, err := toml.Decode(rendered, &decoded); err != nil {
+		t.Fatalf("decode rendered user config: %v", err)
+	}
+	if got := decoded.DesktopExternalOpener(); got != "ghostty" {
+		t.Fatalf("round-trip external opener = %q, want ghostty", got)
+	}
+}
+
 func TestRenderTOMLTablePathQuotesEachSegment(t *testing.T) {
 	got := renderTOMLTablePath("lsp", "servers", "c++", "github:gh-fix-ci")
 	want := `lsp.servers."c++"."github:gh-fix-ci"`

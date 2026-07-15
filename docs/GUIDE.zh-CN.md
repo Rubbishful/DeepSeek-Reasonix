@@ -190,6 +190,22 @@ Goal、由 `todo_write` 工具驱动的实时 Todo 面板，以及已配置 prov
 `--model`、`--max-steps` 或 `--resume`；不传 `--model` 时，`serve` 使用用户全局
 `default_model`。
 
+## 通过 ACP 接入编辑器
+
+`reasonix acp` 向 ACP 编辑器客户端公开三条彼此独立的会话轴：
+
+- `modes`：`normal`、`plan`、`goal`。选择 Goal 后，下一条用户输入会成为活动目标，
+  并启动 Reasonix 现有的 Goal 持续推进循环。
+- `work_mode`：`economy`、`balanced`、`delivery`。切换时会原子重建 Controller，
+  同时保留历史、协作方式和工具权限。`reasonix acp --profile ...` 仍可设置启动默认值。
+- `tool_approval`：`ask`、`auto`、`yolo`。切换权限不会重建 Controller，也不会改变
+  协作方式或工作模式。
+
+模型和推理强度仍是独立的 ACP 配置项。Reasonix 会按 ACP 会话持久化这三条轴；旧会话元数据
+缺少新字段时，工作模式继承 ACP 进程的启动 profile（未传 `--profile` 时为均衡），权限和
+协作方式使用“询问 + 常规”。为兼容旧版混合 mode 列表，`session/set_mode` 仍接受
+`default`（常规 + 询问）和 `auto`（常规 + Yolo），新客户端应使用拆分后的独立选择器。
+
 ## 自定义 OpenAI-compatible provider
 
 在桌面端打开 **设置 -> 模型 -> 接入 -> 添加模型服务 -> 自定义供应商**，用于接入代理、
@@ -705,8 +721,11 @@ ephemeral 只读 subagent，只暴露只读研究工具和安全前台 bash，�
 source 仍会启用可写 skill 工具，plan mode 下继续阻断。
 
 启动会话时可以用 `--profile economy|balanced|delivery` 选择运行模式，例如
-`reasonix run --profile delivery "修复并验证这个 bug"`。Economy（轻量）精简初始工具面并按需
-连接可选来源；Balanced（均衡）是保持旧请求字节兼容的默认档，提供完整工具面；Delivery（交付优先）
+`reasonix run --profile delivery "修复并验证这个 bug"`。Economy（轻量）初始只带 9 个工具：
+直接读/bash/编辑/写入、后台 shell 生命周期控制、`ask` 和 `connect_tool_source`；专用搜索/文件/
+workflow 工具、session history、memory 写入、slash command、Skills、MCP、LSP、网络、安装与
+subagent 都在任务需要时才连接。
+Balanced（均衡）是提供完整工具面的默认档；Delivery（交付优先）
 保留完整工具面，额外增加稳定能力代理 `use_capability`（按需 inspect/call MCP，包括
 `auto_start=false`，且不改变主工具 Schema），并增加“明确验收标准、修复根因、运行验证、复审最终
 diff”的稳定交付合约。该合约由宿主运行时强制执行：没有具体 `todo_write` 验收清单时会阻止变更和验证
@@ -718,8 +737,9 @@ diff”的稳定交付合约。该合约由宿主运行时强制执行：没有�
 `/work-mode economy|balanced|delivery` 热切换；`/profile` 是兼容别名。切换会原子重建
 Controller，同时保留 history、session 路径、Lease 和 Ask/Auto/Yolo 审批姿态；当前 turn、审批/询问、
 后台任务或另一场运行时切换尚未结束时会拒绝切换。构建失败时旧 Controller 继续可用。该命令只修改当前
-会话，不持久化新的全局默认值。跨 Profile 切换会产生一次新的 provider 缓存前缀；进入目标 Profile 后，
-system contract 和工具 Schema 在后续轮次保持稳定。
+会话，不持久化新的全局默认值。跨 Profile 切换会产生一次新的 provider 缓存前缀。均衡与交付优先模式下，
+system contract 和工具 Schema 在后续轮次保持稳定；轻量模式下，每次成功调用 `connect_tool_source`
+都会在下一次请求加入对应工具 Schema，形成一次新前缀，之后在工具面再次变化前保持稳定。
 
 桌面端标签页提供相同三档并持久化轻量或交付优先
 模式；旧的空值/`full` 继续解释为均衡模式。

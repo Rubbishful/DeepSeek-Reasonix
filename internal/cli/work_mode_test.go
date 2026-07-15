@@ -92,7 +92,7 @@ func TestWorkModeSwitchBuildsTargetProfileAndSwapsAtomically(t *testing.T) {
 	m.runtimeProfile = boot.TokenModeFull
 	var gotSpec controllerBuildSpec
 	var gotCarry []provider.Message
-	m.buildController = func(spec controllerBuildSpec, carry []provider.Message, _ string) (*control.Controller, error) {
+	m.buildController = func(spec controllerBuildSpec, carry []provider.Message, _ string, _ control.SessionAPI) (*control.Controller, error) {
 		gotSpec = spec
 		gotCarry = carry
 		return newCtrl, nil
@@ -139,7 +139,7 @@ func TestWorkModeSwitchFailureKeepsOldControllerAndProfile(t *testing.T) {
 	m := newChatTUI(oldCtrl, "", make(chan event.Event, 1), 100)
 	m.modelRef = "provider/model"
 	m.runtimeProfile = boot.TokenModeEconomy
-	m.buildController = func(controllerBuildSpec, []provider.Message, string) (*control.Controller, error) {
+	m.buildController = func(controllerBuildSpec, []provider.Message, string, control.SessionAPI) (*control.Controller, error) {
 		return nil, errors.New("build failed")
 	}
 
@@ -170,7 +170,7 @@ func TestWorkModeSwitchRejectsInvalidSameAndBusyRequests(t *testing.T) {
 	m.modelRef = "provider/model"
 	m.runtimeProfile = boot.TokenModeFull
 	builds := 0
-	m.buildController = func(controllerBuildSpec, []provider.Message, string) (*control.Controller, error) {
+	m.buildController = func(controllerBuildSpec, []provider.Message, string, control.SessionAPI) (*control.Controller, error) {
 		builds++
 		return control.New(control.Options{Label: "new"}), nil
 	}
@@ -211,7 +211,7 @@ func TestWorkModeSwitchRejectsRunningTurn(t *testing.T) {
 	m.modelRef = "provider/model"
 	m.runtimeProfile = boot.TokenModeFull
 	builds := 0
-	m.buildController = func(controllerBuildSpec, []provider.Message, string) (*control.Controller, error) {
+	m.buildController = func(controllerBuildSpec, []provider.Message, string, control.SessionAPI) (*control.Controller, error) {
 		builds++
 		return control.New(control.Options{}), nil
 	}
@@ -230,7 +230,7 @@ func TestRuntimeRebuildCommandsCarryCurrentWorkMode(t *testing.T) {
 	m.modelRef = "deepseek-flash/deepseek-v4-flash"
 	m.runtimeProfile = boot.TokenModeDelivery
 	var specs []controllerBuildSpec
-	m.buildController = func(spec controllerBuildSpec, _ []provider.Message, _ string) (*control.Controller, error) {
+	m.buildController = func(spec controllerBuildSpec, _ []provider.Message, _ string, _ control.SessionAPI) (*control.Controller, error) {
 		specs = append(specs, spec)
 		return control.New(control.Options{Label: "deepseek-flash"}), nil
 	}

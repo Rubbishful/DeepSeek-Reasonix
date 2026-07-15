@@ -321,6 +321,7 @@ func TestGatewayStartsHealthyAdaptersWhenOneFails(t *testing.T) {
 	if err := gw.Start(context.Background()); err != nil {
 		t.Fatalf("start should keep healthy adapters running: %v", err)
 	}
+	defer gw.Stop()
 	if got := gw.AdapterCount(); got != 1 {
 		t.Fatalf("adapter count = %d, want 1", got)
 	}

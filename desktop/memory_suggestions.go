@@ -482,19 +482,22 @@ func skillStoreForWorkspace(workspaceRoot string) *skill.Store {
 	cfg, err := config.LoadForRoot(workspaceRoot)
 	var custom, excluded []string
 	var pluginPaths map[string][]string
+	var pluginAgentPaths map[string][]string
 	maxDepth := 3
 	if err == nil && cfg != nil {
 		custom = cfg.SkillCustomPaths()
 		excluded = cfg.SkillExcludedPaths()
 		pluginPaths = cfg.PluginPackageSkillOwners()
+		pluginAgentPaths = cfg.PluginPackageAgentOwners()
 		maxDepth = cfg.SkillMaxDepth()
 	}
 	return skill.New(skill.Options{
-		ProjectRoot:   strings.TrimSpace(workspaceRoot),
-		CustomPaths:   custom,
-		PluginPaths:   pluginPaths,
-		ExcludedPaths: excluded,
-		MaxDepth:      maxDepth,
+		ProjectRoot:      strings.TrimSpace(workspaceRoot),
+		CustomPaths:      custom,
+		PluginPaths:      pluginPaths,
+		PluginAgentPaths: pluginAgentPaths,
+		ExcludedPaths:    excluded,
+		MaxDepth:         maxDepth,
 	})
 }
 

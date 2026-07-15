@@ -209,6 +209,26 @@ console.log("\ncomposer run strip");
   dom.window.close();
 }
 
+// Runtime controller transitions disable every mode axis and submit together,
+// so rapid Goal + Delivery + YOLO clicks cannot mutate a half-rebuilt runtime.
+{
+  const dom = installDom();
+  const { root } = await renderComposer({ disabled: true, goal: "ship it", collaborationMode: "goal" });
+  const profile = document.querySelector<HTMLButtonElement>(".composer-profile-trigger");
+  const task = document.querySelector<HTMLButtonElement>(".composer-task-mode-trigger");
+  const approvals = Array.from(document.querySelectorAll<HTMLButtonElement>(".composer-modebar--approval button"));
+  const send = document.querySelector<HTMLButtonElement>(".composer__btn--send");
+  ok(Boolean(profile?.disabled), "runtime transition disables Delivery profile changes");
+  ok(Boolean(task?.disabled), "runtime transition disables Goal mode changes");
+  ok(approvals.length === 3 && approvals.every((button) => button.disabled), "runtime transition disables Ask/Auto/YOLO changes");
+  ok(Boolean(send?.disabled), "runtime transition disables submit");
+
+  await act(async () => {
+    root.unmount();
+  });
+  dom.window.close();
+}
+
 // Running: strip lives inside the card, ticker is aria-hidden, stop cancels.
 {
   const dom = installDom();

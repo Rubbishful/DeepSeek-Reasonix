@@ -14,23 +14,28 @@ import (
 )
 
 type PluginView struct {
-	Name             string                `json:"name"`
-	Version          string                `json:"version,omitempty"`
-	Description      string                `json:"description,omitempty"`
-	Source           string                `json:"source,omitempty"`
-	Root             string                `json:"root"`
-	ManifestKind     string                `json:"manifestKind,omitempty"`
-	Enabled          bool                  `json:"enabled"`
-	Skills           int                   `json:"skills"`
-	Commands         int                   `json:"commands"`
-	Hooks            int                   `json:"hooks"`
-	MCPServers       int                   `json:"mcpServers"`
-	SkillDetails     []PluginSkillView     `json:"skillDetails,omitempty"`
-	CommandDetails   []PluginCommandView   `json:"commandDetails,omitempty"`
-	HookDetails      []PluginHookView      `json:"hookDetails,omitempty"`
-	MCPServerDetails []PluginMCPServerView `json:"mcpServerDetails,omitempty"`
-	Warnings         []string              `json:"warnings,omitempty"`
-	Error            string                `json:"error,omitempty"`
+	Name                string                         `json:"name"`
+	Version             string                         `json:"version,omitempty"`
+	Description         string                         `json:"description,omitempty"`
+	Source              string                         `json:"source,omitempty"`
+	Root                string                         `json:"root"`
+	ManifestKind        string                         `json:"manifestKind,omitempty"`
+	Enabled             bool                           `json:"enabled"`
+	Skills              int                            `json:"skills"`
+	Commands            int                            `json:"commands"`
+	Hooks               int                            `json:"hooks"`
+	MCPServers          int                            `json:"mcpServers"`
+	Agents              int                            `json:"agents,omitempty"`
+	Compatibility       string                         `json:"compatibility,omitempty"`
+	MappedCapabilities  []string                       `json:"mappedCapabilities,omitempty"`
+	SkippedCapabilities []pluginpkg.CompatibilityIssue `json:"skippedCapabilities,omitempty"`
+	SkillDetails        []PluginSkillView              `json:"skillDetails,omitempty"`
+	AgentDetails        []PluginAgentView              `json:"agentDetails,omitempty"`
+	CommandDetails      []PluginCommandView            `json:"commandDetails,omitempty"`
+	HookDetails         []PluginHookView               `json:"hookDetails,omitempty"`
+	MCPServerDetails    []PluginMCPServerView          `json:"mcpServerDetails,omitempty"`
+	Warnings            []string                       `json:"warnings,omitempty"`
+	Error               string                         `json:"error,omitempty"`
 }
 
 type PluginInstallOptions struct {
@@ -46,6 +51,15 @@ type PluginSkillView struct {
 	Path        string `json:"path,omitempty"`
 	Invocation  string `json:"invocation,omitempty"`
 	RunAs       string `json:"runAs,omitempty"`
+}
+
+type PluginAgentView struct {
+	Name         string   `json:"name"`
+	Description  string   `json:"description,omitempty"`
+	Path         string   `json:"path,omitempty"`
+	Invocation   string   `json:"invocation,omitempty"`
+	Model        string   `json:"model,omitempty"`
+	AllowedTools []string `json:"allowedTools,omitempty"`
 }
 
 type PluginCommandView struct {
@@ -67,10 +81,13 @@ type PluginHookView struct {
 }
 
 type PluginMCPServerView struct {
-	Name      string `json:"name"`
-	Transport string `json:"transport,omitempty"`
-	Command   string `json:"command,omitempty"`
-	URL       string `json:"url,omitempty"`
+	Name        string `json:"name"`
+	DisplayName string `json:"displayName,omitempty"`
+	Description string `json:"description,omitempty"`
+	Transport   string `json:"transport,omitempty"`
+	Command     string `json:"command,omitempty"`
+	URL         string `json:"url,omitempty"`
+	AutoStart   bool   `json:"autoStart,omitempty"`
 }
 
 func (a *App) Plugins() []PluginView {
@@ -129,6 +146,10 @@ func decoratePluginCommandConflicts(view *PluginView, commands []command.Command
 
 func applyPluginPackageDetails(view *PluginView, pkg pluginpkg.Package, warnings []string) {
 	view.Skills, view.Commands, view.Hooks, view.MCPServers = pkg.CapabilityCounts()
+	view.Agents = pkg.AgentCount()
+	view.Compatibility = pkg.Compatibility.Status
+	view.MappedCapabilities = append([]string(nil), pkg.Compatibility.Mapped...)
+	view.SkippedCapabilities = append([]pluginpkg.CompatibilityIssue(nil), pkg.Compatibility.Skipped...)
 	view.Warnings = warnings
 	inv := pkg.Inventory()
 	view.CommandDetails = make([]PluginCommandView, 0, len(inv.Commands))
@@ -151,6 +172,14 @@ func applyPluginPackageDetails(view *PluginView, pkg pluginpkg.Package, warnings
 			RunAs:       sk.RunAs,
 		})
 	}
+	view.AgentDetails = make([]PluginAgentView, 0, len(inv.Agents))
+	for _, agent := range inv.Agents {
+		view.AgentDetails = append(view.AgentDetails, PluginAgentView{
+			Name: agent.Name, Description: agent.Description, Path: agent.Path,
+			Invocation: "/" + view.Name + ":agent:" + agent.Name, Model: agent.Model,
+			AllowedTools: append([]string(nil), agent.AllowedTools...),
+		})
+	}
 	view.HookDetails = make([]PluginHookView, 0, len(inv.Hooks))
 	for _, hook := range inv.Hooks {
 		view.HookDetails = append(view.HookDetails, PluginHookView{
@@ -164,10 +193,8 @@ func applyPluginPackageDetails(view *PluginView, pkg pluginpkg.Package, warnings
 	view.MCPServerDetails = make([]PluginMCPServerView, 0, len(inv.MCPServers))
 	for _, server := range inv.MCPServers {
 		view.MCPServerDetails = append(view.MCPServerDetails, PluginMCPServerView{
-			Name:      server.Name,
-			Transport: server.Transport,
-			Command:   server.Command,
-			URL:       server.URL,
+			Name: server.Name, DisplayName: server.DisplayName, Description: server.Description,
+			Transport: server.Transport, Command: server.Command, URL: server.URL, AutoStart: server.AutoStart,
 		})
 	}
 }

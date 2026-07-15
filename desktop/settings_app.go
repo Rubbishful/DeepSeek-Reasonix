@@ -1517,6 +1517,8 @@ func (a *App) rebuildSettingLocked(setting string) error {
 	if tab == nil {
 		return fmt.Errorf("no active tab")
 	}
+	tab.turnStartMu.Lock()
+	defer tab.turnStartMu.Unlock()
 	if controllerHasActiveRuntimeWork(a.controllerForTab(tab)) {
 		return rebuildControllerActiveWorkError(setting)
 	}
@@ -1602,16 +1604,18 @@ func (a *App) rebuildSettingLocked(setting string) error {
 	if mode := strings.TrimSpace(snap.toolApprovalMode); mode != "" {
 		applyTabToolApprovalModeToController(ctrl, mode)
 	}
+	// A rebuild must not force the user to re-approve tools already granted
+	// this session, or re-trust Plan-mode read-only commands already trusted
+	// this session.
+	if prev, ok := oldCtrl.(*control.Controller); ok {
+		ctrl.RestoreSessionAuthorizations(prev.SessionAuthorizations())
+	}
 	path := agent.ContinueSessionPath(prevPath, ctrl.SessionDir(), ctrl.Label())
 	if err := a.ensureTabSessionLeaseForRebuild(tab, path, setting); err != nil {
 		ctrl.Close()
 		return err
 	}
-	resumeWithFreshSystemPrompt(ctrl, carried, path)
-	if oldCtrl != nil {
-		oldCtrl.Close()
-	}
-	a.persistTabSessionPath(tab, path)
+	resumeWithFreshSystemPromptAndGoal(ctrl, carried, path, snap.goal)
 	a.mu.Lock()
 	if current := a.tabs[tab.ID]; current != tab {
 		a.mu.Unlock()
@@ -1629,6 +1633,10 @@ func (a *App) rebuildSettingLocked(setting string) error {
 	a.supersedeTabBuildLocked(tab)
 	a.saveTabsLocked()
 	a.mu.Unlock()
+	if oldCtrl != nil {
+		oldCtrl.Close()
+	}
+	a.persistTabSessionPath(tab, path)
 	a.clearDeferredRebuild(tab.ID)
 	a.emitReady(a.ctx)
 	return nil

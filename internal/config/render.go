@@ -104,6 +104,11 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 		} else {
 			b.WriteString("# theme_style = \"graphite\"   # graphite|aurora|slate|carbon|nocturne|amber and legacy aliases\n")
 		}
+		if opener := c.DesktopExternalOpener(); opener != "" {
+			fmt.Fprintf(&b, "external_opener = %q   # desktop Open control: installed application id\n", opener)
+		} else {
+			b.WriteString("# external_opener = \"vscode\"   # desktop Open control: installed application id\n")
+		}
 		fmt.Fprintf(&b, "close_behavior = %q   # desktop: quit|background when the window close button is clicked\n", c.DesktopCloseBehavior())
 		fmt.Fprintf(&b, "status_bar_style = %q   # desktop: icon|text metric labels in the bottom status bar\n", c.DesktopStatusBarStyle())
 		fmt.Fprintf(&b, "status_bar_items = %s   # desktop: ordered visible bottom status bar items\n", renderStringArray(c.DesktopStatusBarItems()))

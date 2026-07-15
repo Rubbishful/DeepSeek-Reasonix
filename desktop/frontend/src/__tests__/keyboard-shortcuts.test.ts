@@ -77,6 +77,10 @@ eq(JSON.stringify(formatShortcutComboParts(defaultShortcutCombo("settings.open",
 eq(formatShortcutCombo(defaultShortcutCombo("settings.open", "windows"), "windows"), "Ctrl+,", "formats Windows settings shortcut");
 eq(JSON.stringify(formatShortcutComboParts(defaultShortcutCombo("settings.open", "windows"), "windows")), JSON.stringify(["Ctrl", ","]), "splits Windows settings shortcut for display");
 eq(shortcutConflict("settings.open", defaultShortcutCombo("commandPalette.open", "darwin"), "darwin")?.action, "commandPalette.open", "detects shortcut conflicts");
+eq(matchesShortcut(event("l", { metaKey: true }), "selection.addToChat", "darwin"), true, "Cmd+L adds the selection to chat on macOS");
+eq(matchesShortcut(event("l", { ctrlKey: true }), "selection.addToChat", "windows"), true, "Ctrl+L adds the selection to chat on Windows");
+eq(matchesShortcut(event("l", { ctrlKey: true, metaKey: true }), "selection.addToChat", "darwin"), false, "extra modifiers do not trigger the selection shortcut");
+eq(shortcutConflict("app.newSession", { key: "l", ctrl: true }, "linux")?.action, "selection.addToChat", "rebinding another action onto Ctrl+L conflicts with the selection shortcut");
 eq(topicShortcutIndexFromEvent(event("1", { metaKey: true }), "darwin"), 0, "Cmd+1 maps to the first topic shortcut on macOS");
 eq(topicShortcutIndexFromEvent(event("1", { ctrlKey: true }), "darwin"), null, "Ctrl+1 is not a topic shortcut on macOS");
 eq(topicShortcutIndexFromEvent(event("9", { ctrlKey: true }), "windows"), 8, "Ctrl+9 maps to the ninth topic shortcut on Windows");

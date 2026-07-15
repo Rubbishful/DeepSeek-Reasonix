@@ -79,6 +79,18 @@ ok(
 );
 
 ok(
+  finalDeclaration(".app--darwin .app-chrome--tabs .tabbar", "--wails-draggable") === "drag" &&
+    finalDeclaration(".app--windows-frameless:not(.app--workbench):not(.app--creation) .app-chrome--native-tabs .tabbar", "--wails-draggable") === "drag",
+  "classic tabbar whitespace drags the window on macOS and frameless Windows",
+);
+
+ok(
+  finalDeclaration(".app--darwin .app-chrome--tabs .tabbar *", "--wails-draggable") === "no-drag" &&
+    finalDeclaration(".app--windows .app-chrome--native-tabs .tabbar *", "--wails-draggable") === "no-drag",
+  "classic tabbar controls and tab gaps remain interactive no-drag regions",
+);
+
+ok(
   /const WORKSPACE_PANEL_DEFAULT_OPEN = true;/.test(layoutStoreSource) &&
     /workspacePanelOpen:\s*WORKSPACE_PANEL_DEFAULT_OPEN/.test(layoutStoreSource),
   "right dock starts expanded on launch",
@@ -231,7 +243,7 @@ ok(
 );
 
 ok(
-  /const controllerReady = state\.meta\?\.ready === true && !state\.backendActivationPending;/.test(appSource) &&
+  /const controllerReady = state\.meta\?\.ready === true && !state\.backendActivationPending && !runtimeTransitioning;/.test(appSource) &&
     /if \(!activeTabId \|\| !controllerReady\) return;\s*void commitThenSend\(activeTabId, text\)\.catch/.test(appSource) &&
     /onPrompt=\{handleTranscriptPrompt\}/.test(appSource) &&
     /submitDisabled=\{!controllerReady\}/.test(appSource),

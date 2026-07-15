@@ -2524,6 +2524,174 @@ func permissionHookController(t *testing.T, match string) (*Controller, chan str
 	return c, ids, payloads
 }
 
+// claudePermissionHookController wires a Claude-imported PermissionRequest
+// hook (PayloadFormat "claude") whose mock spawner always returns stdout, so
+// tests can assert the hook's decision preempts the approval prompt instead
+// of only notifying — matching Claude's own PermissionRequest contract.
+func claudePermissionHookController(t *testing.T, exitCode int, stdout string) (*Controller, chan string) {
+	t.Helper()
+	ids := make(chan string, 8)
+	spawner := func(_ context.Context, in hook.SpawnInput) hook.SpawnResult {
+		return hook.SpawnResult{ExitCode: exitCode, Stdout: stdout}
+	}
+	c := New(Options{
+		Sink: event.FuncSink(func(e event.Event) {
+			if e.Kind == event.ApprovalRequest {
+				ids <- e.Approval.ID
+			}
+		}),
+		Hooks: hook.NewRunner([]hook.ResolvedHook{{
+			HookConfig: hook.HookConfig{Command: "guard", Match: "Bash", PayloadFormat: "claude"},
+			Event:      hook.PermissionRequest,
+			Scope:      hook.ScopeGlobal,
+		}}, "/tmp", spawner, nil),
+	})
+	return c, ids
+}
+
+func TestPermissionRequestClaudeHookAutoDenies(t *testing.T) {
+	c, ids := claudePermissionHookController(t, 2, "")
+	allow, _, err := gateApprover{c}.Approve(context.Background(), "bash", "rm -rf /", json.RawMessage(`{"command":"rm -rf /"}`))
+	if err != nil {
+		t.Fatalf("Approve error = %v", err)
+	}
+	if allow {
+		t.Fatal("a Claude PermissionRequest hook exiting 2 should auto-deny")
+	}
+	select {
+	case id := <-ids:
+		t.Fatalf("auto-deny must preempt the approval prompt, but one was emitted: %s", id)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestPermissionRequestClaudeHookAutoAllows(t *testing.T) {
+	allowJSON := `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}`
+	c, ids := claudePermissionHookController(t, 0, allowJSON)
+	allow, _, err := gateApprover{c}.Approve(context.Background(), "bash", "go test ./...", json.RawMessage(`{"command":"go test ./..."}`))
+	if err != nil {
+		t.Fatalf("Approve error = %v", err)
+	}
+	if !allow {
+		t.Fatal("a Claude PermissionRequest hook returning decision.behavior=allow should auto-allow")
+	}
+	select {
+	case id := <-ids:
+		t.Fatalf("auto-allow must preempt the approval prompt, but one was emitted: %s", id)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// wildcardClaudePermissionHookController is like claudePermissionHookController
+// but matches every tool, for exercising fresh-human-required tools whose
+// names ("remember", "sandbox_escape", ...) aren't Claude tool names.
+func wildcardClaudePermissionHookController(t *testing.T, exitCode int, stdout string) (*Controller, chan string) {
+	t.Helper()
+	ids := make(chan string, 8)
+	spawner := func(_ context.Context, in hook.SpawnInput) hook.SpawnResult {
+		return hook.SpawnResult{ExitCode: exitCode, Stdout: stdout}
+	}
+	c := New(Options{
+		Sink: event.FuncSink(func(e event.Event) {
+			if e.Kind == event.ApprovalRequest {
+				ids <- e.Approval.ID
+			}
+		}),
+		Hooks: hook.NewRunner([]hook.ResolvedHook{{
+			HookConfig: hook.HookConfig{Command: "guard", PayloadFormat: "claude"},
+			Event:      hook.PermissionRequest,
+			Scope:      hook.ScopeGlobal,
+		}}, "/tmp", spawner, nil),
+	})
+	return c, ids
+}
+
+func TestPermissionRequestClaudeHookCannotAutoAllowFreshHumanApproval(t *testing.T) {
+	allowJSON := `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}`
+	for _, tool := range []string{memoryRememberTool, memoryForgetTool, SandboxEscapeApprovalTool, ManagedConfigWriteApprovalTool} {
+		t.Run(tool, func(t *testing.T) {
+			c, ids := wildcardClaudePermissionHookController(t, 0, allowJSON)
+			done := make(chan bool, 1)
+			go func() {
+				allow, _, err := gateApprover{c}.Approve(context.Background(), tool, "", json.RawMessage(`{}`))
+				if err != nil {
+					t.Errorf("Approve error = %v", err)
+					return
+				}
+				done <- allow
+			}()
+
+			id := waitApprovalID(t, ids)
+			c.Approve(id, true, false, false)
+			select {
+			case allow := <-done:
+				if !allow {
+					t.Fatal("manual approval should still allow")
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("approval stayed blocked")
+			}
+		})
+	}
+}
+
+func TestPermissionRequestClaudeHookAutoDeniesFreshHumanApproval(t *testing.T) {
+	// A deny is always safe to auto-honor, even for fresh-human tools —
+	// refusing something that requires a human's blessing can't leak
+	// unauthorized access the way an auto-allow could.
+	for _, tool := range []string{memoryRememberTool, SandboxEscapeApprovalTool} {
+		t.Run(tool, func(t *testing.T) {
+			c, ids := wildcardClaudePermissionHookController(t, 2, "")
+			allow, _, err := gateApprover{c}.Approve(context.Background(), tool, "", json.RawMessage(`{}`))
+			if err != nil {
+				t.Fatalf("Approve error = %v", err)
+			}
+			if allow {
+				t.Fatal("a Claude PermissionRequest hook exiting 2 should auto-deny even a fresh-human tool")
+			}
+			select {
+			case id := <-ids:
+				t.Fatalf("auto-deny must preempt the approval prompt, but one was emitted: %s", id)
+			case <-time.After(50 * time.Millisecond):
+			}
+		})
+	}
+}
+
+// TestPermissionRequestClaudeHookCannotAutoAllowOptsFreshOnlyDecision covers
+// the fresh-human protection's other branch: a tool that requestFreshApprovalDecision
+// marks fresh (opts.fresh=true) without being one of
+// RequiresFreshHumanApprovalTool's fixed cases. PlanModeReadOnlyCommandApprovalTool
+// is exactly that — the earlier tests only exercised tools protected via
+// requiresFreshApprovalTool(tool), not the opts.fresh flag alone.
+func TestPermissionRequestClaudeHookCannotAutoAllowOptsFreshOnlyDecision(t *testing.T) {
+	if RequiresFreshHumanApprovalTool(agent.PlanModeReadOnlyCommandApprovalTool) {
+		t.Fatal("test assumes this tool is fresh-only via opts.fresh, not RequiresFreshHumanApprovalTool")
+	}
+	allowJSON := `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}`
+	c, ids := wildcardClaudePermissionHookController(t, 0, allowJSON)
+	done := make(chan bool, 1)
+	go func() {
+		reply, err := c.requestFreshApprovalDecision(context.Background(), agent.PlanModeReadOnlyCommandApprovalTool, "ls", nil, "trust this read-only command prefix?")
+		if err != nil {
+			t.Errorf("requestFreshApprovalDecision error = %v", err)
+			return
+		}
+		done <- reply.allow
+	}()
+
+	id := waitApprovalID(t, ids)
+	c.Approve(id, true, false, false)
+	select {
+	case allow := <-done:
+		if !allow {
+			t.Fatal("manual approval should still allow")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("approval stayed blocked — a Claude hook allow should not have preempted this opts.fresh decision")
+	}
+}
+
 func waitApprovalID(t *testing.T, ids <-chan string) string {
 	t.Helper()
 	select {
@@ -2795,6 +2963,29 @@ func TestPermissionRequestHookDoesNotFireForSessionGrant(t *testing.T) {
 		t.Fatalf("session-granted approval = (%v,%v), want allowed", allow, err)
 	}
 	assertNoPermissionHook(t, payloads)
+}
+
+// TestSessionAuthorizationsCarryAcrossRebuild pins the fix for a rebuild
+// (model/effort/profile switch) dropping same-session "Allow for this
+// session" tool grants and Plan-mode read-only command trust: only the
+// ask/auto/yolo posture string used to survive a controller swap, so a user
+// who had already granted a tool this session was asked again after any
+// switch.
+func TestSessionAuthorizationsCarryAcrossRebuild(t *testing.T) {
+	old := New(Options{})
+	old.approval.grantSession("bash", "go test ./...")
+	old.approval.grantPlanModeReadOnlyCommand("go test ./...")
+
+	fresh := New(Options{})
+	fresh.RestoreSessionAuthorizations(old.SessionAuthorizations())
+
+	allow, _, err := fresh.requestApproval(context.Background(), "bash", "go test ./...", nil)
+	if err != nil || !allow {
+		t.Fatalf("session-granted approval after restore = (%v,%v), want allowed", allow, err)
+	}
+	if !fresh.approval.planModeReadOnlyCommandTrusted("go test ./...") {
+		t.Fatal("plan-mode read-only command trust did not carry across rebuild")
+	}
 }
 
 func TestPermissionRequestHookDoesNotFireForYolo(t *testing.T) {

@@ -82,6 +82,52 @@ func TestListPrecedenceProjectOverGlobal(t *testing.T) {
 	}
 }
 
+func TestPluginClaudeAgentLoadsAsManualSubagent(t *testing.T) {
+	home := t.TempDir()
+	agentRoot := filepath.Join(t.TempDir(), "agents")
+	writeSkill(t, agentRoot, "reviewer.md", "---\ndescription: Review changes\nmodel: sonnet\ntools: [Read, Grep, \"mcp__*__search\"]\n---\nReview carefully.")
+	key := config.CanonicalSkillPath(agentRoot)
+	st := New(Options{HomeDir: home, CustomPaths: []string{agentRoot}, PluginPaths: map[string][]string{key: {"legal"}}, PluginAgentPaths: map[string][]string{key: {"legal"}}, DisableBuiltins: true})
+	sk, ok := st.Read("reviewer")
+	if !ok {
+		t.Fatal("Claude agent was not discoverable")
+	}
+	if sk.RunAs != RunSubagent || sk.Invocation != "manual" || sk.Model != "" {
+		t.Fatalf("agent profile = %+v", sk)
+	}
+	if sk.SlashName() != "legal:agent:reviewer" {
+		t.Fatalf("agent slash name = %q", sk.SlashName())
+	}
+	want := []string{"read_file", "grep", "mcp__*__search"}
+	if !slices.Equal(sk.AllowedTools, want) {
+		t.Fatalf("allowed tools = %v, want %v", sk.AllowedTools, want)
+	}
+}
+
+func TestPluginAgentAndSkillWithSameNameHaveDistinctQualifiedInvocations(t *testing.T) {
+	home := t.TempDir()
+	skillRoot := filepath.Join(t.TempDir(), "skills")
+	agentRoot := filepath.Join(t.TempDir(), "agents")
+	writeSkill(t, skillRoot, "leave-tracker/SKILL.md", "---\ndescription: Track leave\n---\nSkill body")
+	writeSkill(t, agentRoot, "leave-tracker.md", "---\ndescription: Monitor leave\n---\nAgent body")
+	skillKey := config.CanonicalSkillPath(skillRoot)
+	agentKey := config.CanonicalSkillPath(agentRoot)
+	st := New(Options{
+		HomeDir: home, CustomPaths: []string{skillRoot, agentRoot},
+		PluginPaths:      map[string][]string{skillKey: {"employment-legal"}, agentKey: {"employment-legal"}},
+		PluginAgentPaths: map[string][]string{agentKey: {"employment-legal"}}, DisableBuiltins: true,
+	})
+
+	inline, ok := st.ReadSlash("employment-legal:leave-tracker")
+	if !ok || inline.RunAs != RunInline {
+		t.Fatalf("inline skill = %+v, found=%v", inline, ok)
+	}
+	agent, ok := st.ReadSlash("employment-legal:agent:leave-tracker")
+	if !ok || agent.RunAs != RunSubagent || agent.Invocation != "manual" {
+		t.Fatalf("agent profile = %+v, found=%v", agent, ok)
+	}
+}
+
 func TestPluginSkillsUseQualifiedSlashNamesWithoutChangingModelIndex(t *testing.T) {
 	home := t.TempDir()
 	alpha := t.TempDir()

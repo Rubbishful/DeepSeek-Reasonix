@@ -150,6 +150,41 @@ type recordingSessionRunner struct {
 	memoryCompilerInputs []string
 }
 
+type deliveryScopeErrorRunner struct {
+	scopes []agent.DeliveryExecutionScope
+}
+
+func (r *deliveryScopeErrorRunner) Run(ctx context.Context, _ string) error {
+	if scope, ok := agent.DeliveryExecutionScopeFromContext(ctx); ok {
+		r.scopes = append(r.scopes, scope)
+	}
+	return &agent.FinalReadinessError{Attempts: 3, Reason: "missing verification"}
+}
+
+func TestGoalReadinessFailureBlocksAndKeepsDeliveryScope(t *testing.T) {
+	runner := &deliveryScopeErrorRunner{}
+	c := New(Options{Runner: runner})
+	c.SetGoal("ship the integration")
+
+	err := newTurnOrchestrator(c).runGoalLoopWithRawDisplay(context.Background(), "start", "start", "")
+	var readiness *agent.FinalReadinessError
+	if !errors.As(err, &readiness) {
+		t.Fatalf("run err = %v, want FinalReadinessError", err)
+	}
+	if got := c.GoalStatus(); got != GoalStatusBlocked {
+		t.Fatalf("GoalStatus = %q, want blocked", got)
+	}
+	if len(runner.scopes) != 1 || runner.scopes[0].ID == "" || runner.scopes[0].TaskText != "ship the integration" {
+		t.Fatalf("delivery scopes = %+v", runner.scopes)
+	}
+	if !c.ResumeGoal() || c.GoalStatus() != GoalStatusRunning {
+		t.Fatal("blocked Goal should resume with its existing scope")
+	}
+	if id, task, ok := c.goals.deliveryScope(); !ok || id != runner.scopes[0].ID || task != "ship the integration" {
+		t.Fatalf("resumed scope = (%q, %q, %v), want preserved id/task", id, task, ok)
+	}
+}
+
 func (r *recordingSessionRunner) Run(ctx context.Context, input string) error {
 	r.inputs = append(r.inputs, input)
 	if source, ok := agent.MemoryCompilerSourceInputFromContext(ctx); ok {
@@ -417,13 +452,13 @@ func TestTurnOrchestratorSyntheticTurnDoesNotCreateCheckpoint(t *testing.T) {
 	}
 }
 
-func TestTurnOrchestratorStopHookCancelledContext(t *testing.T) {
+func TestTurnOrchestratorStopFailureHookCancelledContext(t *testing.T) {
 	prov := &scriptedTurns{turns: [][]provider.Chunk{textTurn("done")}}
 	ag := agent.New(prov, tool.NewRegistry(), agent.NewSession(""), agent.Options{}, event.Discard)
 	var stopCalls int
 	hooks := hook.NewRunner([]hook.ResolvedHook{{
 		HookConfig: hook.HookConfig{Command: "stop"},
-		Event:      hook.Stop,
+		Event:      hook.StopFailure,
 		Scope:      hook.ScopeProject,
 	}}, "", func(ctx context.Context, in hook.SpawnInput) hook.SpawnResult {
 		if ctx.Err() != nil {
@@ -431,7 +466,10 @@ func TestTurnOrchestratorStopHookCancelledContext(t *testing.T) {
 		}
 		var p hook.Payload
 		json.Unmarshal([]byte(in.Stdin), &p)
-		if p.Event == hook.Stop {
+		if p.Event == hook.StopFailure {
+			if p.Error == "" || !p.IsInterrupt {
+				t.Errorf("failure payload = %+v", p)
+			}
 			stopCalls++
 		}
 		return hook.SpawnResult{ExitCode: 0}
@@ -444,7 +482,7 @@ func TestTurnOrchestratorStopHookCancelledContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	if stopCalls != 1 {
-		t.Fatalf("Stop hooks called = %d; want 1", stopCalls)
+		t.Fatalf("StopFailure hooks called = %d; want 1", stopCalls)
 	}
 }
 

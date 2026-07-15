@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -230,6 +231,81 @@ func TestApplyLocalClaudePluginPackage(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, ".reasonix", "plugins", "ui-ux-pro-max", ".claude-plugin", "plugin.json")); err != nil {
 		t.Fatalf("installed plugin missing: %v", err)
+	}
+}
+
+func TestApplyCopiedPluginPreservesExecutableHookCommand(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX executable bits are not available on Windows")
+	}
+	project := t.TempDir()
+	home := t.TempDir()
+	src := filepath.Join(t.TempDir(), "executable-plugin")
+	writeFile(t, filepath.Join(src, ".claude-plugin", "plugin.json"), `{"name":"executable-plugin"}`)
+	writeFile(t, filepath.Join(src, "hooks", "hooks.json"), `{
+  "hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"${CLAUDE_PLUGIN_ROOT}/bin/hook","args":["--hook"]}]}]}
+}`)
+	hookPath := filepath.Join(src, "bin", "hook")
+	writeFile(t, hookPath, "#!/bin/sh\nexit 0\n")
+	if err := os.Chmod(hookPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := execInstall(t, NewTool(Options{ProjectRoot: project, HomeDir: home}), map[string]any{
+		"source": src, "kind": "plugin", "apply": true,
+	})
+	if !resp.OK {
+		t.Fatalf("response = %+v", resp)
+	}
+	installed := filepath.Join(home, ".reasonix", "plugins", "executable-plugin", "bin", "hook")
+	info, err := os.Stat(installed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("installed hook mode = %o, want executable", info.Mode().Perm())
+	}
+}
+
+func TestPlanClaudeCompatibilityReportsAgentsHooksAndMCP(t *testing.T) {
+	project := t.TempDir()
+	home := t.TempDir()
+	src := filepath.Join(t.TempDir(), "claude-compat")
+	writeFile(t, filepath.Join(src, ".claude-plugin", "plugin.json"), `{"name":"claude-compat"}`)
+	writeFile(t, filepath.Join(src, "agents", "reviewer.md"), "---\ndescription: Review work\ntools: [Read, Grep]\n---\nReview carefully.")
+	writeFile(t, filepath.Join(src, "hooks", "hooks.json"), `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"${CLAUDE_PLUGIN_ROOT}/bin/critter","args":["--hook"],"async":true}]}]}}`)
+	writeFile(t, filepath.Join(src, ".mcp.json"), `{"mcpServers":{"法律检索":{"command":"uvx","args":["legal-search"]}}}`)
+
+	planned := execInstall(t, NewTool(Options{ProjectRoot: project, HomeDir: home}), map[string]any{"source": src, "kind": "plugin"})
+	if len(planned.Actions) != 1 {
+		t.Fatalf("actions = %+v", planned.Actions)
+	}
+	a := planned.Actions[0]
+	// A Stop hook is imported best-effort, but Reasonix's Stop hook is
+	// observation-only and can't block the turn the way Claude's contract
+	// does, so this must report "partial" rather than silently claiming full
+	// compatibility for semantics it doesn't honor.
+	if a.AgentCount != 1 || a.HookCount != 1 || a.ToolCount != 1 || a.Compatibility != "partial" {
+		t.Fatalf("compatibility action = %+v", a)
+	}
+	if len(a.SkippedCapabilities) != 1 || a.SkippedCapabilities[0].Capability != "hooks" ||
+		!strings.Contains(a.SkippedCapabilities[0].Reason, "cannot block the turn") {
+		t.Fatalf("skipped capabilities = %+v, want a Stop-hook cannot-block warning", a.SkippedCapabilities)
+	}
+	if a.RiskLevel != RiskHigh {
+		t.Fatalf("risk = %s, want high", a.RiskLevel)
+	}
+	if !slices.Contains(a.MappedCapabilities, "agents") || !slices.Contains(a.MappedCapabilities, "hooks") || !slices.Contains(a.MappedCapabilities, "mcp") {
+		t.Fatalf("mapped capabilities = %v", a.MappedCapabilities)
+	}
+}
+
+func TestPlanClaudePluginWithNoMappedCapabilitiesIsBlocked(t *testing.T) {
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, ".claude-plugin", "plugin.json"), `{"name":"empty-claude"}`)
+	resp := execInstall(t, NewTool(Options{ProjectRoot: t.TempDir(), HomeDir: t.TempDir()}), map[string]any{"source": src, "kind": "plugin"})
+	if resp.OK || resp.Status != "blocked" || !strings.Contains(resp.Error, "no compatible capabilities") {
+		t.Fatalf("response = %+v", resp)
 	}
 }
 
@@ -1786,6 +1862,7 @@ func TestGitHubClaudeMarketplaceNameSelectsOnePlugin(t *testing.T) {
 	for _, name := range []string{"alpha-legal", "beta-legal"} {
 		dir := strings.TrimSuffix(name, "-legal")
 		writeFile(t, filepath.Join(marketplaceRoot, dir, ".claude-plugin", "plugin.json"), fmt.Sprintf(`{"name":%q}`, name))
+		writeFile(t, filepath.Join(marketplaceRoot, dir, "CLAUDE.md"), "Plugin context")
 	}
 
 	tl := NewTool(Options{ProjectRoot: t.TempDir(), HomeDir: t.TempDir()})
@@ -1832,6 +1909,7 @@ func TestGitHubClaudeMarketplaceCleansCloneWhenApprovalIsDenied(t *testing.T) {
   "plugins": [{"name": "alpha", "source": "./alpha"}]
 }`)
 	writeFile(t, filepath.Join(marketplaceRoot, "alpha", ".claude-plugin", "plugin.json"), `{"name":"alpha"}`)
+	writeFile(t, filepath.Join(marketplaceRoot, "alpha", "CLAUDE.md"), "Plugin context")
 
 	cleanupCalls := 0
 	tl := NewTool(Options{
@@ -1855,6 +1933,40 @@ func TestGitHubClaudeMarketplaceCleansCloneWhenApprovalIsDenied(t *testing.T) {
 	}
 }
 
+func TestGitHubClaudeMarketplaceCleansPreparedPinnedEntryWhenLaterEntryFails(t *testing.T) {
+	marketplaceRoot := t.TempDir()
+	externalRoot := t.TempDir()
+	pinnedSHA := strings.Repeat("a", 40)
+	writeFile(t, filepath.Join(marketplaceRoot, ".claude-plugin", "marketplace.json"), `{
+  "name":"mixed-tools",
+  "plugins":[
+    {"name":"external","source":{"source":"url","url":"https://github.com/acme/external","sha":"`+pinnedSHA+`"}},
+    {"name":"broken","source":"./missing"}
+  ]
+}`)
+	writeFile(t, filepath.Join(externalRoot, ".claude-plugin", "plugin.json"), `{"name":"external"}`)
+	writeFile(t, filepath.Join(externalRoot, "CLAUDE.md"), "External context")
+
+	mainCleanup, pinnedCleanup := 0, 0
+	tl := NewTool(Options{ProjectRoot: t.TempDir(), HomeDir: t.TempDir()})
+	tool := tl.(*installSourceTool)
+	tool.preparePlugin = func(_ context.Context, source, _ string) (string, string, func(), error) {
+		if strings.Contains(source, "acme/external") {
+			return externalRoot, pinnedSHA, func() { pinnedCleanup++ }, nil
+		}
+		return marketplaceRoot, strings.Repeat("b", 40), func() { mainCleanup++ }, nil
+	}
+	raw, _ := json.Marshal(map[string]any{
+		"source": "https://github.com/acme/mixed-tools", "kind": "plugin", "apply": true,
+	})
+	if _, err := tl.Execute(context.Background(), raw); err == nil {
+		t.Fatal("expected the later broken marketplace entry to fail planning")
+	}
+	if mainCleanup != 1 || pinnedCleanup != 1 {
+		t.Fatalf("cleanup main=%d pinned=%d, want 1/1", mainCleanup, pinnedCleanup)
+	}
+}
+
 // TestGitHubClaudeMarketplaceAcceptsBarePathsAndSkipsUnsupported pins the
 // widened source subset: bare relative paths ("plugins/alpha") plan like
 // "./"-prefixed ones, while object sources, external URLs, and invalid names
@@ -1874,6 +1986,8 @@ func TestGitHubClaudeMarketplaceAcceptsBarePathsAndSkipsUnsupported(t *testing.T
 }`)
 	writeFile(t, filepath.Join(marketplaceRoot, "plugins", "alpha", ".claude-plugin", "plugin.json"), `{"name":"alpha-legal"}`)
 	writeFile(t, filepath.Join(marketplaceRoot, "plugins", "beta", ".claude-plugin", "plugin.json"), `{"name":"beta-legal"}`)
+	writeFile(t, filepath.Join(marketplaceRoot, "plugins", "alpha", "CLAUDE.md"), "Plugin context")
+	writeFile(t, filepath.Join(marketplaceRoot, "plugins", "beta", "CLAUDE.md"), "Plugin context")
 
 	tl := NewTool(Options{ProjectRoot: t.TempDir(), HomeDir: t.TempDir()})
 	tool := tl.(*installSourceTool)
@@ -1897,7 +2011,7 @@ func TestGitHubClaudeMarketplaceAcceptsBarePathsAndSkipsUnsupported(t *testing.T
 	joined := strings.Join(plan.Warnings, "\n")
 	for _, fragment := range []string{
 		`"external": external source`,
-		`"object": only relative string sources`,
+		`"object": object source is not a pinned GitHub URL`,
 		`"bad/name": not a valid plugin name`,
 	} {
 		if !strings.Contains(joined, fragment) {
@@ -1936,6 +2050,38 @@ func TestGitHubClaudeMarketplaceSelectedUnsupportedSourceFails(t *testing.T) {
 	}
 }
 
+func TestGitHubClaudeMarketplaceAcceptsPinnedGitHubURLObject(t *testing.T) {
+	marketplaceRoot := t.TempDir()
+	pluginRoot := t.TempDir()
+	sha := strings.Repeat("a", 40)
+	writeFile(t, filepath.Join(marketplaceRoot, ".claude-plugin", "marketplace.json"), fmt.Sprintf(`{
+  "name":"critter-marketplace",
+  "plugins":[{"name":"agent-critter","source":{"source":"url","url":"https://github.com/Jedeiah/agent-critter.git","sha":%q}}]
+}`, sha))
+	writeFile(t, filepath.Join(pluginRoot, ".claude-plugin", "plugin.json"), `{"name":"agent-critter"}`)
+	writeFile(t, filepath.Join(pluginRoot, "hooks", "hooks.json"), `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"${CLAUDE_PLUGIN_ROOT}/bin/agent-critter","args":["--hook"],"async":true}]}]}}`)
+
+	cleanupCalls := 0
+	tl := NewTool(Options{ProjectRoot: t.TempDir(), HomeDir: t.TempDir()})
+	tool := tl.(*installSourceTool)
+	tool.preparePlugin = func(_ context.Context, source, _ string) (string, string, func(), error) {
+		if source == "https://github.com/acme/critter-marketplace" {
+			return marketplaceRoot, "parent", func() {}, nil
+		}
+		if source == "https://github.com/Jedeiah/agent-critter.git" {
+			return pluginRoot, sha, func() { cleanupCalls++ }, nil
+		}
+		return "", "", func() {}, fmt.Errorf("unexpected source %s", source)
+	}
+	plan := execInstall(t, tl, map[string]any{"source": "https://github.com/acme/critter-marketplace", "kind": "plugin"})
+	if len(plan.Actions) != 1 || plan.Actions[0].Commit != sha || plan.Actions[0].HookCount != 1 {
+		t.Fatalf("pinned plan = %+v", plan)
+	}
+	if cleanupCalls != 1 {
+		t.Fatalf("external preview cleanup calls = %d", cleanupCalls)
+	}
+}
+
 // TestGitHubClaudeMarketplacePlanIDStableAcrossPlanAndApply pins the approval
 // contract the desktop host relies on: the planId returned by the preview must
 // match the planId recomputed by the apply call, or every marketplace apply
@@ -1952,6 +2098,8 @@ func TestGitHubClaudeMarketplacePlanIDStableAcrossPlanAndApply(t *testing.T) {
 }`)
 	writeFile(t, filepath.Join(marketplaceRoot, "plugins", "alpha", ".claude-plugin", "plugin.json"), `{"name":"alpha-legal"}`)
 	writeFile(t, filepath.Join(marketplaceRoot, "plugins", "beta", ".claude-plugin", "plugin.json"), `{"name":"beta-legal"}`)
+	writeFile(t, filepath.Join(marketplaceRoot, "plugins", "alpha", "CLAUDE.md"), "Plugin context")
+	writeFile(t, filepath.Join(marketplaceRoot, "plugins", "beta", "CLAUDE.md"), "Plugin context")
 
 	home := t.TempDir()
 	tl := NewTool(Options{ProjectRoot: t.TempDir(), HomeDir: home})

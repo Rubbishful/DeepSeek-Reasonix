@@ -204,6 +204,27 @@ func TestDesktopLayoutStyleNormalizes(t *testing.T) {
 	}
 }
 
+func TestDesktopExternalOpenerValidation(t *testing.T) {
+	c := Default()
+	if got := c.DesktopExternalOpener(); got != "" {
+		t.Fatalf("default external opener = %q, want empty platform fallback", got)
+	}
+	if err := c.SetDesktopExternalOpener(" Cursor "); err != nil {
+		t.Fatalf("SetDesktopExternalOpener: %v", err)
+	}
+	if got := c.DesktopExternalOpener(); got != "cursor" {
+		t.Fatalf("DesktopExternalOpener = %q, want cursor", got)
+	}
+	for _, invalid := range []string{"../../bin/sh", "vscode;open", "app id"} {
+		if err := c.SetDesktopExternalOpener(invalid); err == nil {
+			t.Fatalf("SetDesktopExternalOpener(%q) unexpectedly succeeded", invalid)
+		}
+	}
+	if err := c.SetDesktopExternalOpener(""); err != nil || c.DesktopExternalOpener() != "" {
+		t.Fatalf("clearing external opener = (%q, %v), want empty", c.DesktopExternalOpener(), err)
+	}
+}
+
 func TestDesktopStatusBarStyleNormalizes(t *testing.T) {
 	if got := Default().DesktopStatusBarStyle(); got != "text" {
 		t.Fatalf("default desktop status bar style = %q, want text", got)

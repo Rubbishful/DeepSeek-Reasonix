@@ -73,7 +73,7 @@ func (o *turnOrchestrator) runSubagentSkillTurnsGoalLoop(ctx context.Context, sk
 // answers only. Child reasoning and tool chatter stay out of the
 // provider-visible parent context while their UI events nest under synthetic
 // top-level run_skill cards.
-func (o *turnOrchestrator) runSubagentSkillTurns(ctx context.Context, skills []skill.Skill, task, raw, display string, runner skill.SubagentRunner, planMode bool) error {
+func (o *turnOrchestrator) runSubagentSkillTurns(ctx context.Context, skills []skill.Skill, task, raw, display string, runner skill.SubagentRunner, planMode bool) (err error) {
 	c := o.c
 	c.maybeSessionStart(ctx)
 	parentSession := c.parentSessionID()
@@ -100,7 +100,7 @@ func (o *turnOrchestrator) runSubagentSkillTurns(ctx context.Context, skills []s
 		if block, _ := c.hooks.PromptSubmit(ctx, input, turn); block {
 			return nil
 		}
-		defer func() { c.hooks.Stop(context.Background(), lastAssistantText(c.History()), turn) }()
+		defer func() { c.hooks.StopResult(context.Background(), lastAssistantText(c.History()), turn, err) }()
 	}
 
 	c.markInFlightTurn(startMessages, true)
@@ -150,7 +150,7 @@ func (o *turnOrchestrator) runSubagentSkillTurns(ctx context.Context, skills []s
 	return nil
 }
 
-func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchestratedTurn) error {
+func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchestratedTurn) (err error) {
 	c := o.c
 	c.maybeSessionStart(ctx)
 	if !turn.synthetic {
@@ -198,7 +198,7 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 		if block, _ := c.hooks.PromptSubmit(ctx, input, turn); block {
 			return nil // the hook's notify callback already surfaced the reason
 		}
-		defer func() { c.hooks.Stop(context.Background(), lastAssistantText(c.History()), turn) }()
+		defer func() { c.hooks.StopResult(context.Background(), lastAssistantText(c.History()), turn, err) }()
 	}
 	c.markInFlightTurn(startMessages, !turn.synthetic && !IsSyntheticUserMessage(turn.raw))
 	autoResearchTaskID := c.goals.currentAutoResearchTaskID()
@@ -208,7 +208,11 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 	if !turn.synthetic {
 		modelInput = c.withCapabilityRoute(input, turn.raw)
 	}
-	err := c.runner.Run(ctx, modelInput)
+	if scopeID, task, ok := c.goals.deliveryScope(); ok {
+		ctx = agent.WithDeliveryExecutionScope(ctx, agent.DeliveryExecutionScope{ID: scopeID, TaskText: task})
+	}
+	err = c.runner.Run(ctx, modelInput)
+	c.persistGoalDeliveryCheckpoint()
 	if err == nil {
 		c.recordAutoResearchEvidenceFromAssistant(autoResearchTaskID, lastAssistantText(c.History()))
 		c.recordAutoResearchTurnProgress(autoResearchTaskID, autoResearchAcceptedBefore)
@@ -280,6 +284,11 @@ func (o *turnOrchestrator) runGoalLoopWithRawDisplay(ctx context.Context, input,
 	if err := o.runTurnWithRawDisplay(ctx, input, raw, display); err != nil {
 		if ctx.Err() != nil {
 			o.c.stopGoal(GoalStatusStopped)
+		} else {
+			var readiness *agent.FinalReadinessError
+			if errors.As(err, &readiness) {
+				o.c.stopGoal(GoalStatusBlocked)
+			}
 		}
 		return err
 	}
@@ -290,6 +299,11 @@ func (o *turnOrchestrator) runEditedGoalLoopWithRawDisplay(ctx context.Context, 
 	if err := o.runEditedTurnWithRawDisplay(ctx, input, raw, display, original); err != nil {
 		if ctx.Err() != nil {
 			o.c.stopGoal(GoalStatusStopped)
+		} else {
+			var readiness *agent.FinalReadinessError
+			if errors.As(err, &readiness) {
+				o.c.stopGoal(GoalStatusBlocked)
+			}
 		}
 		return err
 	}

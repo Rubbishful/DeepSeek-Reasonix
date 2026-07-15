@@ -44,6 +44,7 @@ import { generativeMusic, isGenerativeMusicEnabled } from "./lib/generative-musi
 import { clearAttentionChimeKeys, playAttentionChime, playSuccessChime, shouldPlayAttentionChimeForEvent } from "./lib/sound";
 import { NoticeCard, Transcript } from "./components/Transcript";
 import { Composer } from "./components/Composer";
+import { TranscriptSelectionMenu } from "./components/TranscriptSelectionMenu";
 import { TodoPanel } from "./components/TodoPanel";
 import { ApprovalModal } from "./components/ApprovalModal";
 import { AskCard } from "./components/AskCard";
@@ -66,6 +67,7 @@ import { ProjectTree } from "./components/ProjectTree";
 import { HeartbeatPanel } from "./custom/features/heartbeat/HeartbeatPanel";
 import "./custom/features/heartbeat/heartbeat.css";
 import { CopyButton } from "./components/CopyButton";
+import { ExternalOpener } from "./components/ExternalOpener";
 import { parseTodos } from "./lib/tools";
 import {
   dismissedTodoKeyForScope,
@@ -93,6 +95,7 @@ import {
   type ToolApprovalMode,
 } from "./lib/types";
 import type { InvocationMetadataMap, StructuredInvocationSubmit } from "./lib/invocationDisplay";
+import { formatSelectionReference, type SelectedTextInsertRequest } from "./lib/selectedTextContext";
 import {
   composerProfileFromMeta,
   composerProfileFromTab,
@@ -169,6 +172,7 @@ import { createRafResizeUpdater } from "./lib/resizeDrag";
 import { useGlobalShortcut } from "./lib/keyboardShortcuts";
 import { topicShortcutIndexFromEvent, useTopicShortcuts, type TopicShortcutEntry } from "./lib/topicShortcuts";
 import { composerDraftKeyForTab } from "./lib/composerDraftKey";
+import { continueDelivery } from "./lib/deliveryContinue";
 import logoWordmark from "./assets/logo-wordmark.svg";
 
 function noticePreviewMockEnabled(): boolean {
@@ -1007,6 +1011,7 @@ export default function App() {
     setToolApprovalModeForTab: setControllerToolApprovalModeForTab,
     setGoal: setControllerGoal,
     setGoalForTab: setControllerGoalForTab,
+    resumeGoalForTab: resumeControllerGoalForTab,
     clearGoal: clearControllerGoal,
     clearSession,
     listSessions,
@@ -1040,6 +1045,8 @@ export default function App() {
   const { locale, setPref: setLocalePref } = useI18n();
   const t = useT();
   const [composerProfilesByTab, setComposerProfilesByTab] = useState<Record<string, ComposerProfile>>({});
+  const runtimeTransitionTabsRef = useRef<Set<string>>(new Set());
+  const [runtimeTransitionsByTab, setRuntimeTransitionsByTab] = useState<Record<string, true>>({});
   const yoloRestoreToolApprovalModesRef = useRef<Record<string, RestorableToolApprovalMode>>({});
   const userPlanModeByTabRef = useRef<UserPlanModeIntents>({});
   const [tabMetas, setTabMetas] = useState<TabMeta[]>([]);
@@ -1155,6 +1162,8 @@ export default function App() {
   const [projectRevision, setProjectRevision] = useState(0);
   const [activeTopicTurns, setActiveTopicTurns] = useState<number | undefined>(undefined);
   const [composerInsertRequestsByTab, setComposerInsertRequestsByTab] = useState<Record<string, ComposerInsertRequest>>({});
+  const [selectedTextRequestsByTab, setSelectedTextRequestsByTab] = useState<Record<string, SelectedTextInsertRequest>>({});
+  const selectedTextRequestIdRef = useRef(0);
   const [planRevisionInsertRequest, setPlanRevisionInsertRequest] = useState<{
     tabId: string;
     approvalId: string;
@@ -1438,6 +1447,7 @@ export default function App() {
       ? planRevisionInsertRequest.request
       : null;
   const composerInsertRequest = activeTabId ? composerInsertRequestsByTab[activeTabId] ?? null : null;
+  const selectedTextRequest = activeTabId ? selectedTextRequestsByTab[activeTabId] ?? null : null;
   const prefillSubagentCommand = useCallback((command: string) => {
     if (!activeTabId) return;
     setComposerInsertRequestsByTab((current) => ({
@@ -1503,7 +1513,8 @@ export default function App() {
   const collaborationMode = displayedComposerProfileCollaborationMode(composerProfile);
   const toolApprovalMode = composerProfile.toolApprovalMode;
   const tokenMode: TokenMode = composerProfile.tokenMode;
-  const controllerReady = state.meta?.ready === true && !state.backendActivationPending;
+  const runtimeTransitioning = Boolean(activeTabId && runtimeTransitionsByTab[activeTabId]);
+  const controllerReady = state.meta?.ready === true && !state.backendActivationPending && !runtimeTransitioning;
   // Single footer decision surface. Composer stays mounted underneath and is
   // only visually/a11y-hidden so per-session draft caches survive.
   const decisionSurface = useMemo((): DecisionSurfaceKind | null => {
@@ -1655,7 +1666,7 @@ export default function App() {
     applyToolApprovalMode(next.mode);
   }, [activeTabId, applyToolApprovalMode, toolApprovalMode]);
   const applyGoal = useCallback(
-    (nextGoal: string) => {
+    async (nextGoal: string): Promise<void> => {
       userPlanModeByTabRef.current = updateUserPlanModeIntent(userPlanModeByTabRef.current, activeTabId, false);
       const trimmed = nextGoal.trim();
       patchActiveComposerProfile({
@@ -1663,16 +1674,36 @@ export default function App() {
         goalDraftMode: false,
         goal: trimmed,
       }, ["collaborationMode", "goal"]);
-      void (trimmed ? setControllerGoal(trimmed) : clearControllerGoal());
+      await (trimmed ? setControllerGoal(trimmed) : clearControllerGoal());
     },
     [activeTabId, clearControllerGoal, patchActiveComposerProfile, setControllerGoal],
   );
   const applyTokenMode = useCallback(
-    (m: TokenMode) => {
-      patchActiveComposerProfile({ tokenMode: m }, ["tokenMode"]);
-      void setTokenMode(m);
+    async (m: TokenMode): Promise<void> => {
+      const tabId = activeTabId;
+      if (!tabId || runtimeTransitionTabsRef.current.has(tabId) || m === composerProfile.tokenMode) return;
+      const previous = composerProfile.tokenMode;
+      runtimeTransitionTabsRef.current.add(tabId);
+      setRuntimeTransitionsByTab((current) => ({ ...current, [tabId]: true }));
+      setComposerProfilesByTab((current) => patchComposerProfile(current, tabId, composerProfile, { tokenMode: m }, ["tokenMode"]));
+      const switched = await setTokenMode(m);
+      if (!switched) {
+        setComposerProfilesByTab((current) => {
+          const profile = current[tabId] ?? composerProfile;
+          const pending = { ...profile.pending };
+          delete pending.tokenMode;
+          return { ...current, [tabId]: { ...profile, tokenMode: previous, pending } };
+        });
+      }
+      runtimeTransitionTabsRef.current.delete(tabId);
+      setRuntimeTransitionsByTab((current) => {
+        if (!current[tabId]) return current;
+        const next = { ...current };
+        delete next[tabId];
+        return next;
+      });
     },
-    [patchActiveComposerProfile, setTokenMode],
+    [activeTabId, composerProfile, setTokenMode],
   );
   // Shift+Tab toggles only the collaboration axis; Ctrl/Cmd+Y toggles YOLO on the
   // tool-permission axis while preserving the Ask/Auto base mode.
@@ -1901,10 +1932,10 @@ export default function App() {
               goal: displayGoal,
             }, ["collaborationMode", "goal"]);
           } else {
-            applyGoal(displayGoal);
+            await applyGoal(displayGoal);
           }
         } else if (["clear", "off", "stop", "done"].includes(displayGoal.toLowerCase())) {
-          applyGoal("");
+          await applyGoal("");
         }
         if (!controllerReady) return;
         await commitThenSendRef.current(sourceTabId, trimmed, submitText.trim());
@@ -1912,7 +1943,7 @@ export default function App() {
       }
       if (collaborationMode === "goal" && !goal.trim()) {
         if (!controllerReady) return;
-        applyGoal(trimmed);
+        await applyGoal(trimmed);
         await commitThenSendRef.current(sourceTabId, trimmed, `/goal ${submitText.trim()}`);
         return;
       }
@@ -2402,6 +2433,35 @@ export default function App() {
     }
   }, [activeTabId, state.approval, workspaceInsertTarget]);
 
+  const addSelectedTextToComposer = useCallback((text: string) => {
+    const selected = text.trim();
+    if (!activeTabId || !selected) return;
+    selectedTextRequestIdRef.current += 1;
+    setSelectedTextRequestsByTab((current) => ({
+      ...current,
+      [activeTabId]: { id: selectedTextRequestIdRef.current, text: selected },
+    }));
+  }, [activeTabId]);
+
+  const addWorkspaceCodeToComposer = useCallback((path: string, code: string) => {
+    if (!activeTabId || !code.trim()) return;
+    if (workspaceInsertTarget === "planRevision" && state.approval?.tool === "exit_plan_mode") {
+      // The plan-revision input is plain text and only consumes request.text,
+      // so hand it the fenced rendering instead of a structured reference.
+      setPlanRevisionInsertRequest({
+        tabId: activeTabId,
+        approvalId: state.approval.id,
+        request: { id: Date.now(), text: formatSelectionReference(path, code) },
+      });
+      return;
+    }
+    selectedTextRequestIdRef.current += 1;
+    setSelectedTextRequestsByTab((current) => ({
+      ...current,
+      [activeTabId]: { id: selectedTextRequestIdRef.current, text: code, path },
+    }));
+  }, [activeTabId, state.approval, workspaceInsertTarget]);
+
   // Coalesce tab-bar switches through the same last-click-wins scheduler that
   // openTopic/blank/resume navigation uses, so rapidly clicking between two
   // running sessions can't run two switchTab() calls concurrently. Concurrent
@@ -2587,6 +2647,17 @@ export default function App() {
       console.warn("Failed to submit transcript prompt", err);
     });
   }, [activeTabId, commitThenSend, controllerReady]);
+
+  const handleDeliveryContinue = useCallback(async () => {
+    await continueDelivery({
+      tabId: activeTabIdRef.current,
+      ready: controllerReady,
+      goal: state.meta?.goal,
+      activeTabId: () => activeTabIdRef.current,
+      resumeGoal: resumeControllerGoalForTab,
+      send: (tabId) => commitThenSend(tabId, t("notice.deliveryIncompleteContinuePrompt")),
+    });
+  }, [commitThenSend, controllerReady, resumeControllerGoalForTab, state.meta?.goal, t]);
   commitThenSendRef.current = commitThenSend;
 
   const handleMessageAction = useCallback((turn: number, scope: string) => {
@@ -3198,6 +3269,7 @@ export default function App() {
         browserPreviewChrome ? "app--browser-preview" : "",
         sidebarWorkbench ? "app--workbench" : "",
         sidebarCreation ? "app--creation" : "",
+        !sidebarWorkbench && !sidebarCreation ? "app--classic" : "",
       ].filter(Boolean).join(" ")}
     >
       <div
@@ -3667,6 +3739,9 @@ export default function App() {
                   </button>
                 </Tooltip>
               )}
+              {!sidebarImDetailConnection && activeTab?.scope === "project" && (
+                <ExternalOpener tabId={activeTab.id} dismissSignal={transientOverlayDismissSignal} />
+              )}
               <Tooltip label={t("shortcuts.cheatsheetTitle")}>
                 <button
                   className="topicbar__action-btn topicbar__action-btn--icon topicbar__action-btn--utility"
@@ -3741,6 +3816,7 @@ export default function App() {
                 tabId={activeTabId}
                 footerHeight={footerHeight}
                 onPrompt={handleTranscriptPrompt}
+                onDeliveryContinue={() => void handleDeliveryContinue()}
                 onEditPrompt={handleEditPrompt}
                 onRewind={handleMessageAction}
                 checkpoints={state.checkpoints}
@@ -3877,8 +3953,9 @@ export default function App() {
               onSetEffort={setEffort}
               onSetTokenMode={applyTokenMode}
               insertRequest={composerInsertRequest}
+              selectedTextRequest={selectedTextRequest}
               readOnly={Boolean(activeTab?.readOnly)}
-              disabled={rewindCommitting || state.messageAction != null || Boolean(decisionSurface)}
+              disabled={runtimeTransitioning || rewindCommitting || state.messageAction != null || Boolean(decisionSurface)}
               submitDisabled={!controllerReady}
               decisionPending={rewindCommitting || state.messageAction != null || Boolean(decisionSurface)}
               ready={controllerReady}
@@ -4019,6 +4096,7 @@ export default function App() {
                   }}
                   onPreviewModeChange={handleWorkspacePreviewModeChange}
                   onAddToChat={addWorkspaceTextToComposer}
+                  onAddCodeToChat={addWorkspaceCodeToComposer}
                   onRequestPanelWidth={ensureWorkspacePanelWidth}
                   onFileTreeRefresh={refreshComposerFileRefs}
                   refreshKey={dockRefreshKey}
@@ -4104,6 +4182,11 @@ export default function App() {
       <HeartbeatPanel open={heartbeatOpen} onClose={() => setHeartbeatOpen(false)} onOpenTopic={(scope, workspaceRoot, topicId) => {
         void handleOpenTopic(scope, workspaceRoot, topicId);
       }} />
+      <TranscriptSelectionMenu
+        enabled={Boolean(activeTabId && !activeTab?.readOnly && !decisionSurface && !sidebarImDetailConnection && !hydratePlaceholderActive)}
+        resetKey={activeTabId ?? ""}
+        onAddToChat={addSelectedTextToComposer}
+      />
       {windowsFramelessChrome && <WindowsWindowControls />}
     </div>
     </ShellExpandProvider>
