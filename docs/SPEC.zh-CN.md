@@ -107,10 +107,11 @@ interface (`call` / `notify` / `close`) abstracts that, so the MCP-level logic
 (handshake, `tools/list`, `tools/call`, …) is written once.
 外部插件是指在配置文件中声明的 MCP 服务器。所有的实例的通信协议都应采用**JSON-RPC 2.0**，只是传输渠道 `transport` 不同。`transport`接口包含 `call` / `notify` / `close` 提供对通信端口的抽象，因此 MCP 层面的逻辑，如握手、 `tools/list` ， `tools/call` 等， 只会实现一次。
 
-- **Transports** (config `type`):
-  - `stdio` (default) — a local subprocess; one JSON message per line over the
+- **传输渠道** (配置文件 `type` 字段):
+  - `stdio` （默认） — 本地子进程; one JSON message per line over the
     child's stdin/stdout (the MCP stdio convention). Declared with
     `command` / `args` / `env`; terminated on ctx cancel / shutdown.
+    
   - `http` (a.k.a. `streamable-http`) — a remote server at `url`. Each request
     is an HTTP POST; the server replies with either `application/json` (one
     response) or `text/event-stream` (an SSE stream carrying the response plus
